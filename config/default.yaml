@@ -9,6 +9,9 @@ whisper:
   model: whisper-1
   language: en
 
+openai:
+  api_key: ${OPENAI_API_KEY}
+
 llm:
   system_prompt: "You are a helpful Horizon Road Rescue dispatcher. Ask for the vehicle type, location, and issue. Confirm if they need immediate towing."
 
