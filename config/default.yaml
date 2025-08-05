@@ -4,7 +4,9 @@ elevenlabs:
   model: eleven_monolingual_v1
 
 whisper:
-  model: base
+  api_key: ${WHISPER_API_KEY}
+  api_url: https://api.openai.com/v1/audio/transcriptions
+  model: whisper-1
   language: en
 
 llm:
