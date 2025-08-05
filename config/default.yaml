@@ -1,1 +1,14 @@
+elevenlabs:
+  api_key: ${ELEVENLABS_API_KEY}
+  voice_id: ${ELEVENLABS_VOICE_ID}
+  model: eleven_monolingual_v1
 
+whisper:
+  model: base
+  language: en
+
+llm:
+  system_prompt: "You are a helpful Horizon Road Rescue dispatcher. Ask for the vehicle type, location, and issue. Confirm if they need immediate towing."
+
+telephony:
+  input_format: wav
