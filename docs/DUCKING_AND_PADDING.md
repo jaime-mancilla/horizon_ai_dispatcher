@@ -1,0 +1,1 @@
+Pre/post padding, VAD-based quiet wait, multi-turn gating, and Whisper prompt; chunk size 2.5s.
