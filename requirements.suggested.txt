@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+aiohttp
+python-dotenv
+PyYAML
+twilio

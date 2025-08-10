@@ -1,0 +1,2 @@
+run-api:
+	bash scripts/dev_server.sh
