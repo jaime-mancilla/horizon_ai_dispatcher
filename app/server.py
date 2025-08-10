@@ -31,16 +31,26 @@ app = FastAPI(title="Horizon AI Dispatcher (Track B)")
 # ---------- Config ----------
 SAMPLE_RATE_IN = 8000
 BYTES_PER_SAMPLE = 2
-SECONDS_PER_CHUNK = float(os.getenv("STT_CHUNK_S", "2.5"))
-LINEAR_BYTES_TARGET = int(SAMPLE_RATE_IN * BYTES_PER_SAMPLE * SECONDS_PER_CHUNK)
 
-TTS_GAIN_DB = float(os.getenv("TTS_GAIN_DB", "12"))
-TTS_MIN_GAP_MS = int(os.getenv("TTS_MIN_GAP_MS", "3500"))
-TTS_PAD_PRE_MS = int(os.getenv("TTS_PAD_PRE_MS", "250"))
-TTS_PAD_POST_MS = int(os.getenv("TTS_PAD_POST_MS", "300"))
+# Adaptive endpointing: flush as soon as we detect silence OR at max window
+STT_CHUNK_S = float(os.getenv("STT_CHUNK_S", "1.6"))  # smaller for faster first reply
+LINEAR_BYTES_TARGET = int(SAMPLE_RATE_IN * BYTES_PER_SAMPLE * STT_CHUNK_S)
+STT_FLUSH_ON_SILENCE = os.getenv("STT_FLUSH_ON_SILENCE", "1") == "1"
+STT_MIN_MS = int(os.getenv("STT_MIN_MS", "700"))
+VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "500"))
+VAD_QUIET_MS = int(os.getenv("VAD_QUIET_MS", "250"))
+
+TTS_GAIN_DB = float(os.getenv("TTS_GAIN_DB", "8"))          # slightly lower default
+TTS_PEAK_TARGET = float(os.getenv("TTS_PEAK_TARGET", "0.82"))  # 0..1 of full-scale
+TTS_MIN_GAP_MS = int(os.getenv("TTS_MIN_GAP_MS", "3200"))
+TTS_MIN_GAP_AFTER_BARGE_MS = int(os.getenv("TTS_MIN_GAP_AFTER_BARGE_MS", "900"))
+TTS_PAD_PRE_MS = int(os.getenv("TTS_PAD_PRE_MS", "220"))
+TTS_PAD_POST_MS = int(os.getenv("TTS_PAD_POST_MS", "260"))
 ELEVEN_FMT = os.getenv("ELEVENLABS_OUTPUT_FORMAT", "pcm_16000").lower()
-
 FIRST_REPLY_WAIT_FOR_QUIET = os.getenv("FIRST_REPLY_WAIT_FOR_QUIET", "0") == "1"
+ENABLE_BARGE_IN = os.getenv("ENABLE_BARGE_IN", "1") == "1"
+
+WHISPER_PROMPT = os.getenv("WHISPER_PROMPT", "Towing and roadside assistance. Year make model, location, issue, urgency.")
 
 # ---------- Utils ----------
 def _public_ws_url(request: Request) -> str:
@@ -48,9 +58,15 @@ def _public_ws_url(request: Request) -> str:
     scheme = "wss"
     return f"{scheme}://{host}/twilio/media"
 
+def _rms(pcm16: bytes) -> float:
+    try:
+        return audioop.rms(pcm16, 2)
+    except Exception:
+        return 0.0
+
 def _silence_ulaw(ms: int) -> bytes:
     samples = int(8000 * ms / 1000)
-    return bytes([0xFF]) * samples  # μ-law silence is 0xFF
+    return bytes([0xFF]) * samples  # μ-law silence byte
 
 # ---------- HTTP ----------
 @app.get("/healthz")
@@ -68,14 +84,16 @@ async def twilio_voice_webhook(request: Request):
 </Response>'''
     return Response(content=twiml, media_type="application/xml")
 
-# ---------- STT ----------
-IGNORE_PATTERNS = [r"www\.", r"http[s]?://", r"FEMA\.gov", r"un\.org", r"For more UN videos", r"For more information"]
+# ---------- STT with adaptive endpointing ----------
+IGNORE_PATTERNS = [r"www\\.", r"http[s]?://", r"FEMA\\.gov", r"un\\.org", r"For more UN videos", r"For more information"]
 
 class STTBuffer:
     def __init__(self, on_text=None):
         self.linear_pcm = bytearray()
         self.inflight = False
         self.on_text = on_text
+        self.last_voice_at = time.monotonic()
+        self.bytes_since_last_flush = 0
 
     def add_ulaw_b64(self, payload_b64: str):
         try:
@@ -85,6 +103,19 @@ class STTBuffer:
             log.warning(f"Failed ulaw decode: {e}")
             return
         self.linear_pcm.extend(lin)
+        self.bytes_since_last_flush += len(lin)
+
+        # Adaptive: flush earlier if we detect "enough" and then silence
+        if STT_FLUSH_ON_SILENCE:
+            rms = _rms(lin)
+            now = time.monotonic()
+            if rms > VAD_RMS_THRESHOLD:
+                self.last_voice_at = now
+            quiet_ms = (now - self.last_voice_at) * 1000.0
+            if quiet_ms >= VAD_QUIET_MS and len(self.linear_pcm) >= max(2, int(SAMPLE_RATE_IN*BYTES_PER_SAMPLE*STT_MIN_MS/1000)):
+                self.flush_to_whisper()
+                return
+
         if len(self.linear_pcm) >= LINEAR_BYTES_TARGET:
             self.flush_to_whisper()
 
@@ -103,20 +134,19 @@ class STTBuffer:
         if not self.linear_pcm or self.inflight:
             return
         chunk = bytes(self.linear_pcm); self.linear_pcm.clear()
-        wav_bytes = self._to_wav_bytes(chunk)
 
         if _openai_client is None:
-            log.info("[stt] (dry-run) WAV=%d", len(wav_bytes)); return
+            log.info("[stt] (dry-run) bytes=%d", len(chunk)); return
 
         self.inflight = True
         try:
-            bio = BytesIO(wav_bytes); bio.name = "clip.wav"; bio.seek(0)
+            bio = BytesIO(self._to_wav_bytes(chunk)); bio.name = "clip.wav"; bio.seek(0)
             resp = _openai_client.audio.transcriptions.create(
                 model="whisper-1",
                 file=bio,
                 response_format="json",
                 language="en",
-                prompt=os.getenv("WHISPER_PROMPT", "Towing and roadside assistance. Year make model, location, issue, urgency."),
+                prompt=WHISPER_PROMPT,
             )
             text = getattr(resp, "text", None) or (resp.get("text") if isinstance(resp, dict) else None)
             if text and len(text.strip()) >= 2 and not any(re.search(p, text, re.I) for p in IGNORE_PATTERNS):
@@ -131,7 +161,7 @@ class STTBuffer:
         finally:
             self.inflight = False
 
-# ---------- TTS ----------
+# ---------- TTS helpers (normalization + padding) ----------
 def _apply_gain_linear(frames: bytes, sampwidth: int, gain_db: float) -> bytes:
     if gain_db <= 0: return frames
     factor = pow(10.0, gain_db / 20.0)
@@ -142,10 +172,34 @@ def _parse_wav(data: bytes):
     with wave.open(BytesIO(data), "rb") as wf:
         return wf.getnchannels(), wf.getsampwidth(), wf.getframerate(), wf.readframes(wf.getnframes())
 
+def _peak_normalize(pcm16: bytes, target_ratio: float) -> bytes:
+    # target_ratio in (0,1): e.g., 0.82 => ~ -1.7 dBFS
+    if not pcm16: return pcm16
+    # Find peak abs value
+    peak = 1
+    for i in range(0, len(pcm16), 2):
+        s = int.from_bytes(pcm16[i:i+2], "little", signed=True)
+        if abs(s) > peak: peak = abs(s)
+    max_allowed = int(32767 * target_ratio)
+    if peak <= 0: return pcm16
+    if peak <= max_allowed: return pcm16
+    scale = max_allowed / float(peak)
+    # scale samples
+    out = bytearray(len(pcm16))
+    for i in range(0, len(pcm16), 2):
+        s = int.from_bytes(pcm16[i:i+2], "little", signed=True)
+        s = int(s * scale)
+        if s > 32767: s = 32767
+        if s < -32768: s = -32768
+        out[i:i+2] = s.to_bytes(2, "little", signed=True)
+    return bytes(out)
+
 def _to_ulaw_8k_from_linear(frames: bytes, sw: int, sr: int, nch: int, gain_db: float = 0.0) -> bytes:
     if sw != 2: frames = audioop.lin2lin(frames, sw, 2); sw = 2
     if nch == 2: frames = audioop.tomono(frames, 2, 0.5, 0.5); nch = 1
     if sr != 8000: frames, _ = audioop.ratecv(frames, 2, 1, sr, 8000, None); sr = 8000
+    # normalize then gain
+    frames = _peak_normalize(frames, TTS_PEAK_TARGET)
     if gain_db > 0: frames = _apply_gain_linear(frames, 2, gain_db)
     return audioop.lin2ulaw(frames, 2)
 
@@ -176,6 +230,7 @@ def convert_elevenlabs_to_ulaw8k(data: bytes, fmt: str, gain_db: float) -> bytes
     pre = _silence_ulaw(TTS_PAD_PRE_MS); post = _silence_ulaw(TTS_PAD_POST_MS)
     return pre + ulaw + post
 
+# ---------- Outbound Speaker with Barge-in ----------
 class TTSSpeaker:
     def __init__(self, ws: WebSocket, stream_sid: str):
         self.ws = ws; self.stream_sid = stream_sid
@@ -183,6 +238,9 @@ class TTSSpeaker:
         self._task = asyncio.create_task(self._worker())
         self._last_reply_at = 0.0
         self._last_hash = None
+        self.playing = False
+        self.cancel_event = asyncio.Event()
+        self.after_barge = False
 
     async def _worker(self):
         try:
@@ -195,18 +253,31 @@ class TTSSpeaker:
 
     async def _stream_ulaw(self, ulaw: bytes, mark_name: str):
         FRAME_BYTES = 160; total = 0
+        self.playing = True
+        self.cancel_event.clear()
         for i in range(0, len(ulaw), FRAME_BYTES):
+            if self.cancel_event.is_set() and ENABLE_BARGE_IN:
+                log.info("[barge] caller started speaking — aborting playback")
+                break
             payload = base64.b64encode(ulaw[i:i+FRAME_BYTES]).decode("ascii")
             msg = {"event": "media", "streamSid": self.stream_sid, "media": {"payload": payload}}
             await self.ws.send_text(json.dumps(msg))
             total += len(ulaw[i:i+FRAME_BYTES])
             await asyncio.sleep(0.02)
-        await self.ws.send_text(json.dumps({"event": "mark", "streamSid": self.stream_sid, "mark": {"name": mark_name}}))
-        log.info(f"[tts] streamed {total} ulaw bytes to Twilio (mark={mark_name})")
+        self.playing = False
+        # Only send mark if we actually finished the clip
+        if not self.cancel_event.is_set():
+            await self.ws.send_text(json.dumps({"event": "mark", "streamSid": self.stream_sid, "mark": {"name": mark_name}}))
+            log.info(f"[tts] streamed {total} ulaw bytes to Twilio (mark={mark_name})")
+        else:
+            self.after_barge = True
+            log.info(f"[tts] aborted after {total} bytes due to barge-in")
 
     async def enqueue_text(self, text: str):
         now = time.monotonic()
-        if (now - self._last_reply_at) * 1000 < TTS_MIN_GAP_MS:
+        # allow shorter cooldown after barge-in
+        min_gap = TTS_MIN_GAP_AFTER_BARGE_MS if self.after_barge else TTS_MIN_GAP_MS
+        if (now - self._last_reply_at) * 1000 < min_gap:
             log.info("[tts] suppressed (cooldown)"); return
         h = hash(text.strip().lower())
         if h == self._last_hash:
@@ -220,7 +291,7 @@ class TTSSpeaker:
 
     async def beep(self):
         if os.getenv("TTS_BEEP_ON_CONNECT", "0") != "1": return
-        sr = 8000; n = int(sr * 0.7); amp = int(32767 * 0.3)
+        sr = 8000; n = int(sr * 0.5); amp = int(32767 * 0.28)  # slightly softer/shorter
         pcm = bytearray()
         for i in range(n):
             s = int(amp * math.sin(2 * math.pi * 880.0 * (i / sr)))
@@ -248,8 +319,7 @@ async def twilio_media_ws(ws: WebSocket):
             asyncio.create_task(speaker.enqueue_text("Thanks, I hear you. What is the vehicle year, make, and model?"))
             return
         if FIRST_REPLY_WAIT_FOR_QUIET:
-            rms = audioop.rms(pcm, 2)
-            if rms > 500:
+            if _rms(pcm) > VAD_RMS_THRESHOLD:
                 log.info("[tts] gated (not quiet)"); return
         asyncio.create_task(speaker.enqueue_text("Could you also tell me your exact location?"))
 
@@ -282,6 +352,15 @@ async def twilio_media_ws(ws: WebSocket):
                     asyncio.create_task(speaker.beep())
                 elif event == "media":
                     payload_b64 = data.get("media", {}).get("payload", "")
+                    # barge-in: if caller is speaking loudly while we're playing, cancel
+                    if speaker and speaker.playing and ENABLE_BARGE_IN:
+                        try:
+                            ulaw = base64.b64decode(payload_b64)
+                            lin = audioop.ulaw2lin(ulaw, BYTES_PER_SAMPLE)
+                            if _rms(lin) > VAD_RMS_THRESHOLD:
+                                speaker.cancel_event.set()
+                        except Exception:
+                            pass
                     stt.add_ulaw_b64(payload_b64)
                     frames += 1
                     if frames % 25 == 0: log.info(f"[media] frames={frames}")
