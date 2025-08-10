@@ -15,7 +15,7 @@ from starlette.websockets import WebSocketState
 try:
     from openai import OpenAI
     _openai_client = OpenAI()
-except Exception as e:
+except Exception:
     _openai_client = None
 
 log = logging.getLogger("hid.media")
@@ -23,9 +23,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 
 app = FastAPI(title="Horizon AI Dispatcher (Track B)")
 
-SAMPLE_RATE = 8000  # Hz
-BYTES_PER_SAMPLE = 2  # 16-bit linear PCM after ulaw decode
-SECONDS_PER_CHUNK = 1.0  # micro-batch size for Whisper
+SAMPLE_RATE = 8000            # Hz
+BYTES_PER_SAMPLE = 2          # 16-bit linear PCM
+SECONDS_PER_CHUNK = 2.0       # throttle Whisper calls (was 1.0)
 LINEAR_BYTES_TARGET = int(SAMPLE_RATE * BYTES_PER_SAMPLE * SECONDS_PER_CHUNK)
 
 def _public_ws_url(request: Request) -> str:
@@ -41,58 +41,56 @@ async def healthz():
 async def twilio_voice_webhook(request: Request):
     ws_url = _public_ws_url(request)
     log.info(f"Returning TwiML with Media Stream URL: {ws_url}")
-    # Use <Connect><Stream> to enable bidirectional later (when we add TTS)
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Connect>
-    <Stream url="{ws_url}" />
-  </Connect>
+  <Say>Horizon Road Rescue dispatcher connected. Please speak after the tone.</Say>
+  <Connect><Stream url="{ws_url}" /></Connect>
 </Response>"""
     return Response(content=twiml, media_type="application/xml")
 
 class STTBuffer:
     def __init__(self):
         self.linear_pcm = bytearray()
-        self.last_flush = time.time()
+        self.inflight = False           # prevent overlapping Whisper calls
+        self.chunks_sent = 0
+        self.text_total = 0
 
     def add_ulaw_b64(self, payload_b64: str):
-        # Decode base64 -> 8-bit mu-law -> 16-bit linear PCM
         try:
             ulaw = base64.b64decode(payload_b64)
-            lin = audioop.ulaw2lin(ulaw, BYTES_PER_SAMPLE)  # 16-bit
+            lin = audioop.ulaw2lin(ulaw, BYTES_PER_SAMPLE)
         except Exception as e:
             log.warning(f"Failed ulaw decode: {e}")
             return
-
         self.linear_pcm.extend(lin)
         if len(self.linear_pcm) >= LINEAR_BYTES_TARGET:
             self.flush_to_whisper()
 
     def finish(self):
-        if self.linear_pcm:
+        if self.linear_pcm and not self.inflight:
             self.flush_to_whisper()
 
     def _to_wav_bytes(self, pcm_bytes: bytes) -> bytes:
         buf = BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(1)
-            wf.setsampwidth(BYTES_PER_SAMPLE)  # 16-bit
+            wf.setsampwidth(BYTES_PER_SAMPLE)
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes(pcm_bytes)
         return buf.getvalue()
 
     def flush_to_whisper(self):
-        if not self.linear_pcm:
+        if not self.linear_pcm or self.inflight:
             return
         chunk = bytes(self.linear_pcm)
         self.linear_pcm.clear()
-
         wav_bytes = self._to_wav_bytes(chunk)
 
         if _openai_client is None:
-            log.info("[stt] (dry-run) Whisper disabled (no client). WAV bytes=%d", len(wav_bytes))
+            log.info("[stt] (dry-run) WAV bytes=%d", len(wav_bytes))
             return
 
+        self.inflight = True
         try:
             bio = BytesIO(wav_bytes)
             bio.name = "clip.wav"
@@ -103,12 +101,16 @@ class STTBuffer:
                 language="en"
             )
             text = getattr(resp, "text", None) or (resp.get("text") if isinstance(resp, dict) else None)
+            self.chunks_sent += 1
             if text:
+                self.text_total += len(text)
                 log.info(f"[stt] {text}")
             else:
                 log.info("[stt] (no text)")
         except Exception as e:
             log.warning(f"[stt] Whisper error: {e}")
+        finally:
+            self.inflight = False
 
 @app.websocket("/twilio/media")
 async def twilio_media_ws(ws: WebSocket):
@@ -119,14 +121,22 @@ async def twilio_media_ws(ws: WebSocket):
     log.info("WS accepted (subprotocol=audio): /twilio/media")
     try:
         while True:
-            message = await ws.receive()
+            try:
+                message = await ws.receive()
+            except WebSocketDisconnect:
+                log.info("WS disconnect (peer)")
+                break
+            except RuntimeError as e:
+                # Starlette raises this after disconnect: "Cannot call receive once a disconnect message has been received."
+                log.info(f"WS receive after disconnect: {e}")
+                break
+
             if message["type"] == "websocket.receive":
                 payload_text = None
                 if "text" in message and message["text"] is not None:
                     payload_text = message["text"]
                 elif "bytes" in message and message["bytes"] is not None:
                     payload_text = message["bytes"].decode("utf-8", "ignore")
-
                 if not payload_text:
                     continue
 
@@ -154,9 +164,10 @@ async def twilio_media_ws(ws: WebSocket):
                     break
                 else:
                     log.info(f"[media] other event: {event}")
-    except WebSocketDisconnect:
-        log.info("WS disconnect")
+            # ignore other message types
+
     finally:
-        if ws.application_state != WebSocketState.DISCONNECTED:
+        # Only close if still connected to avoid "Unexpected ASGI message 'websocket.close'"
+        if ws.application_state == WebSocketState.CONNECTED:
             await ws.close()
-        log.info("WS closed")
+        log.info(f"WS closed summary: frames={frames} chunks={stt.chunks_sent} text_chars={stt.text_total}")
