@@ -6,8 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.trackB.txt /app/
-RUN pip install -U pip && pip install -r requirements.trackB.txt
+COPY requirements.trackB.txt requirements.stt.txt /app/
+RUN pip install -U pip && pip install -r requirements.trackB.txt -r requirements.stt.txt
 
 COPY . /app
 
