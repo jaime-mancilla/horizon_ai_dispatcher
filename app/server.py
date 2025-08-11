@@ -10,11 +10,12 @@ import time
 import math
 import re
 import contextlib
-import random
+from pathlib import Path
+import zipfile
 
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, HTTPException
+from fastapi.responses import PlainTextResponse, FileResponse
 from starlette.websockets import WebSocketState
 
 # OpenAI SDK (v1+) for Whisper
@@ -33,19 +34,22 @@ app = FastAPI(title="Horizon AI Dispatcher (Track B)")
 SAMPLE_RATE_IN = 8000
 BYTES_PER_SAMPLE = 2
 
-# Endpointing (fast first reply)
+# Recording / debug
+RECORD_CALL = os.getenv("RECORD_CALL", "0") == "1"
+RECORD_DIR = os.getenv("RECORD_DIR", "/tmp/recordings")
+Path(RECORD_DIR).mkdir(parents=True, exist_ok=True)
+
+# Endpointing
 STT_CHUNK_S = float(os.getenv("STT_CHUNK_S", "1.4"))
 LINEAR_BYTES_TARGET = int(SAMPLE_RATE_IN * BYTES_PER_SAMPLE * STT_CHUNK_S)
 STT_FLUSH_ON_SILENCE = os.getenv("STT_FLUSH_ON_SILENCE", "1") == "1"
 STT_MIN_MS = int(os.getenv("STT_MIN_MS", "600"))
 VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "700"))
 VAD_QUIET_MS = int(os.getenv("VAD_QUIET_MS", "250"))
-
-# STT gating
 STT_RMS_GATE = int(os.getenv("STT_RMS_GATE", "350"))
 STT_MIN_GAP_BETWEEN_CALLS_MS = int(os.getenv("STT_MIN_GAP_BETWEEN_CALLS_MS", "800"))
 
-# TTS loudness/flow
+# TTS
 TTS_GAIN_DB = float(os.getenv("TTS_GAIN_DB", "6"))
 TTS_PEAK_TARGET = float(os.getenv("TTS_PEAK_TARGET", "0.78"))
 TTS_MIN_GAP_MS = int(os.getenv("TTS_MIN_GAP_MS", "2400"))
@@ -54,15 +58,14 @@ TTS_PAD_PRE_MS = int(os.getenv("TTS_PAD_PRE_MS", "600"))
 TTS_PAD_POST_MS = int(os.getenv("TTS_PAD_POST_MS", "500"))
 ELEVEN_FMT = os.getenv("ELEVENLABS_OUTPUT_FORMAT", "pcm_16000").lower()
 
-# ElevenLabs quality controls
-ELEVEN_LATENCY_MODE = os.getenv("ELEVEN_LATENCY_MODE", "1")  # "0","1","2","3"
+ELEVEN_LATENCY_MODE = os.getenv("ELEVEN_LATENCY_MODE", "1")
 ELEVEN_SPEED = float(os.getenv("ELEVEN_SPEED", "0.95"))
 ELEVEN_STABILITY = float(os.getenv("ELEVEN_STABILITY", "0.5"))
 ELEVEN_SIMILARITY = float(os.getenv("ELEVEN_SIMILARITY", "0.75"))
 ELEVEN_STYLE = float(os.getenv("ELEVEN_STYLE", "0.35"))
 ELEVEN_SPEAKER_BOOST = os.getenv("ELEVEN_SPEAKER_BOOST", "1") == "1"
 
-# Interaction behavior
+# Turn-taking
 FIRST_REPLY_WAIT_FOR_QUIET = os.getenv("FIRST_REPLY_WAIT_FOR_QUIET", "0") == "1"
 ENABLE_BARGE_IN = os.getenv("ENABLE_BARGE_IN", "1") == "1"
 BARGE_GRACE_MS = int(os.getenv("BARGE_GRACE_MS", "900"))
@@ -73,12 +76,16 @@ LOG_TTS_DEBUG = os.getenv("LOG_TTS_DEBUG", "0") == "1"
 AUTO_TEST_TTS = os.getenv("AUTO_TEST_TTS", "0") == "0"
 
 WHISPER_PROMPT = os.getenv("WHISPER_PROMPT", "Towing and roadside assistance. Year make model, location, issue, urgency. Keep transcripts concise.")
+TWILIO_RECORD_CALL = os.getenv("TWILIO_RECORD_CALL", "0") == "1"
 
 # ---------- Utils ----------
 def _public_ws_url(request: Request) -> str:
     host = request.headers.get("x-forwarded-host") or request.url.hostname
     scheme = "wss"
     return f"{scheme}://{host}/twilio/media"
+
+def _public_host(request: Request) -> str:
+    return request.headers.get("x-forwarded-host") or request.url.hostname
 
 def _rms(pcm16: bytes) -> float:
     try:
@@ -90,6 +97,11 @@ def _silence_ulaw(ms: int) -> bytes:
     samples = int(8000 * ms / 1000)
     return bytes([0xFF]) * samples  # μ-law silence byte
 
+def _to_wav(path, pcm16: bytes, sr: int = 8000):
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sr)
+        wf.writeframes(pcm16)
+
 # ---------- HTTP ----------
 @app.get("/healthz")
 async def healthz():
@@ -98,27 +110,89 @@ async def healthz():
 @app.post("/twilio/voice", response_class=PlainTextResponse)
 async def twilio_voice_webhook(request: Request):
     ws_url = _public_ws_url(request)
-    log.info(f"Returning TwiML with Media Stream URL: {ws_url}")
+    start_record = "<Start><Recording/></Start>" if TWILIO_RECORD_CALL else ""
     twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+  {start_record}
   <Say>Horizon Road Rescue dispatcher connected. Please speak after the tone.</Say>
   <Connect><Stream url="{ws_url}" /></Connect>
 </Response>'''
     return Response(content=twiml, media_type="application/xml")
 
+# ---------- Recording manager ----------
+class Recorder:
+    def __init__(self, call_sid: str):
+        self.call_sid = call_sid or f"call-{int(time.time())}"
+        self.in_ulaw = bytearray()
+        self.out_ulaw = bytearray()
+        self.stt_lines = []
+        self.tts_lines = []
+
+    def add_in_ulaw_b64(self, b64: str):
+        try:
+            self.in_ulaw.extend(base64.b64decode(b64))
+        except Exception:
+            pass
+
+    def add_out_ulaw_chunk(self, ulaw: bytes):
+        self.out_ulaw.extend(ulaw)
+
+    def add_stt(self, text: str):
+        ts = time.strftime("%H:%M:%S")
+        self.stt_lines.append(f"[{ts}] {text}")
+
+    def add_tts(self, text: str):
+        ts = time.strftime("%H:%M:%S")
+        self.tts_lines.append(f"[{ts}] {text}")
+
+    def finalize_files(self) -> dict:
+        def ulaw_to_pcm16(ulaw: bytes) -> bytes:
+            try:
+                return audioop.ulaw2lin(ulaw, 2)
+            except Exception:
+                return b""
+
+        in_pcm = ulaw_to_pcm16(bytes(self.in_ulaw))
+        out_pcm = ulaw_to_pcm16(bytes(self.out_ulaw))
+
+        base = Path(RECORD_DIR) / self.call_sid
+        in_path = base.with_suffix(".in.wav")
+        out_path = base.with_suffix(".out.wav")
+        stt_path = base.with_suffix(".stt.txt")
+        tts_path = base.with_suffix(".tts.txt")
+        bundle_path = base.with_suffix(".zip")
+
+        _to_wav(in_path, in_pcm, 8000)
+        _to_wav(out_path, out_pcm, 8000)
+        with open(stt_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(self.stt_lines))
+        with open(tts_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(self.tts_lines))
+
+        with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in (in_path, out_path, stt_path, tts_path):
+                zf.write(p, arcname=p.name)
+
+        return {"in_wav": str(in_path), "out_wav": str(out_path),
+                "stt": str(stt_path), "tts": str(tts_path), "zip": str(bundle_path)}
+
 # ---------- STT (non-blocking) ----------
 IGNORE_PATTERNS = [r"www\\.", r"http[s]?://", r"FEMA\\.gov", r"un\\.org", r"For more UN videos", r"For more information"]
 
 class STTBuffer:
-    def __init__(self, on_text=None):
+    def __init__(self, on_text=None, recorder: Recorder | None = None):
         self.linear_pcm = bytearray()
         self.inflight = False
         self.on_text = on_text
         self.last_voice_at = time.monotonic()
         self.last_whisper_at = 0.0
         self.loop = asyncio.get_running_loop()
+        self.recorder = recorder
 
     def add_ulaw_b64(self, payload_b64: str):
+        if self.recorder and RECORD_CALL:
+            self.recorder.add_in_ulaw_b64(payload_b64)
+
         try:
             ulaw = base64.b64decode(payload_b64)
             lin = audioop.ulaw2lin(ulaw, BYTES_PER_SAMPLE)
@@ -183,6 +257,8 @@ class STTBuffer:
             text = getattr(resp, "text", None) or (resp.get("text") if isinstance(resp, dict) else None)
             if text and len(text.strip()) >= 2 and not any(re.search(p, text, re.I) for p in IGNORE_PATTERNS):
                 log.info(f"[stt] {text}")
+                if self.recorder and RECORD_CALL:
+                    self.recorder.add_stt(text)
                 if self.on_text:
                     try: self.on_text(text, chunk)
                     except Exception as e: log.warning(f"[stt] on_text error: {e}")
@@ -235,15 +311,15 @@ async def elevenlabs_tts_bytes(text: str) -> tuple[bytes, str]:
     if not api_key or not voice_id: raise RuntimeError("Missing ELEVENLABS env vars")
     fmt = ELEVEN_FMT
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    params = {"optimize_streaming_latency": str(ELEVEN_LATENCY_MODE), "output_format": fmt}
+    params = {"optimize_streaming_latency": os.getenv("ELEVEN_LATENCY_MODE", "1"), "output_format": fmt}
     accept = "audio/wav" if fmt == "wav" else "audio/pcm"
     headers = {"xi-api-key": api_key, "accept": accept, "content-type": "application/json"}
     voice_settings = {
-        "stability": ELEVEN_STABILITY,
-        "similarity_boost": ELEVEN_SIMILARITY,
-        "style": ELEVEN_STYLE,
-        "use_speaker_boost": ELEVEN_SPEAKER_BOOST,
-        "speed": ELEVEN_SPEED,
+        "stability": float(os.getenv("ELEVEN_STABILITY", "0.5")),
+        "similarity_boost": float(os.getenv("ELEVEN_SIMILARITY", "0.75")),
+        "style": float(os.getenv("ELEVEN_STYLE", "0.35")),
+        "use_speaker_boost": os.getenv("ELEVEN_SPEAKER_BOOST", "1") == "1",
+        "speed": float(os.getenv("ELEVEN_SPEED", "0.95")),
     }
     body = {"text": text, "model_id": os.getenv("ELEVENLABS_MODEL_ID", "eleven_monolingual_v1"),
             "voice_settings": voice_settings}
@@ -265,196 +341,29 @@ def convert_elevenlabs_to_ulaw8k(data: bytes, fmt: str, gain_db: float) -> bytes
     pre = _silence_ulaw(TTS_PAD_PRE_MS); post = _silence_ulaw(TTS_PAD_POST_MS)
     return pre + ulaw + post
 
-# ---------- Conversation state ----------
-VEHICLE_MAKES = r"(ford|chevy|chevrolet|gmc|ram|dodge|toyota|honda|nissan|jeep|bmw|mercedes|benz|kia|hyundai|subaru|vw|volkswagen|audi|lexus|infiniti|acura|mazda|buick|cadillac|chrysler|lincoln|volvo|porsche|jaguar|land rover|mini|mitsubishi|tesla)"
-VEHICLE_TYPES = r"(car|truck|suv|van|pickup|tow ?truck|box ?truck)"
-LOC_HINTS = r"(nashville|tennessee|i[- ]?\d+|hwy|highway|exit|rd|road|st|street|ave|avenue|blvd|pike|tn-?\d+)"
-ISSUE_HINTS = r"(flat|tire|battery|dead|won'?t start|no start|engine|overheat|overheating|accident|lock(ed)? out|fuel|gas|out of gas|tow|winch|ditch|stuck)"
-
-class DialogState:
-    def __init__(self):
-        self.vehicle = False
-        self.location = False
-        self.issue = False
-        self.urgency = False
-        self.first_reply_sent = False
-        self.prompt_rephrase_ix = 0
-
-    def update_from_text(self, text: str):
-        t = text.lower()
-        if re.search(r"\b(20\d{2}|19\d{2})\b", t) or re.search(VEHICLE_MAKES, t) or re.search(VEHICLE_TYPES, t):
-            self.vehicle = True
-        if re.search(LOC_HINTS, t):
-            self.location = True
-        if re.search(ISSUE_HINTS, t):
-            self.issue = True
-        if re.search(r"(right now|asap|urgent|immediately|today|tonight|this (morning|evening)|blocking|in traffic)", t):
-            self.urgency = True
-
-    def need(self):
-        if not self.vehicle: return "vehicle"
-        if not self.location: return "location"
-        if not self.issue: return "issue"
-        if not self.urgency: return "urgency"
-        return None
-
-    def next_prompt(self):
-        need = self.need()
-        if need is None:
-            return "Thanks. I can get a truck headed your way. What’s a good callback number in case we get disconnected?"
-        options = {
-            "vehicle": [
-                "Thanks, I hear you. What is the vehicle year, make, and model?",
-                "Got it. Can you tell me the vehicle year, make, and model?",
-                "Okay. What are the year, make, and model of the vehicle?"
-            ],
-            "location": [
-                "Where are you exactly—an address, intersection, or nearby business?",
-                "What’s your exact location or the nearest cross-street?",
-                "Tell me where the vehicle is—an address or a landmark works."
-            ],
-            "issue": [
-                "What happened with the vehicle—flat tire, won’t start, accident, or something else?",
-                "What seems to be the issue with the vehicle?",
-                "Tell me what’s going on with the vehicle so we send the right truck."
-            ],
-            "urgency": [
-                "Is this urgent right now, or is the vehicle in a safe spot?",
-                "Do you need help immediately, or can it wait a bit?",
-                "How urgent is it—are you blocking traffic or in a safe place?"
-            ]
-        }
-        arr = options[need]
-        p = arr[self.prompt_rephrase_ix % len(arr)]
-        self.prompt_rephrase_ix += 1
-        return p
-
-# ---------- Outbound Speaker ----------
-class TTSSpeaker:
-    def __init__(self, ws: WebSocket, stream_sid: str):
-        self.ws = ws
-        self.stream_sid = stream_sid
-        self.q = asyncio.Queue()
-        self._task = asyncio.create_task(self._worker())
-        self._last_reply_at = 0.0
-        self._last_hash = None
-        self.playing = False
-        self.cancel_event = asyncio.Event()
-        self.after_barge = False
-
-    async def _worker(self):
-        try:
-            while True:
-                ulaw, mark_name, protect = await self.q.get()
-                if LOG_TTS_DEBUG:
-                    log.info(f"[tts-worker] dequeued len={len(ulaw)} mark={mark_name} protect={protect} qsize={self.q.qsize()}")
-                await self._stream_ulaw(ulaw, mark_name, protect)
-                self.q.task_done()
-        except asyncio.CancelledError:
-            if LOG_TTS_DEBUG:
-                log.info("[tts-worker] cancelled")
-
-    async def _stream_ulaw(self, ulaw: bytes, mark_name: str, protect: bool):
-        FRAME_BYTES = 160  # 20 ms
-        total = 0
-        self.playing = True
-        self.cancel_event.clear()
-        frames_played = 0
-        if LOG_TTS_DEBUG:
-            log.info(f"[tts-stream] start bytes={len(ulaw)} grace={BARGE_GRACE_MS}ms barge={ENABLE_BARGE_IN} protect={protect}")
-        while frames_played * FRAME_BYTES < len(ulaw):
-            start = frames_played * FRAME_BYTES
-            end = start + FRAME_BYTES
-            payload = base64.b64encode(ulaw[start:end]).decode("ascii")
-            msg = {"event": "media", "streamSid": self.stream_sid, "media": {"payload": payload}}
-            await self.ws.send_text(json.dumps(msg))
-            total += end - start
-            frames_played += 1
-
-            played_ms = frames_played * 20
-            if self.cancel_event.is_set() and ENABLE_BARGE_IN and not protect and played_ms >= BARGE_GRACE_MS:
-                log.info(f"[barge] aborting playback after {played_ms} ms (grace={BARGE_GRACE_MS} ms)")
-                break
-
-            if LOG_TTS_DEBUG and frames_played % 25 == 0:
-                log.info(f"[tts-stream] frames={frames_played} sent={total}")
-
-            await asyncio.sleep(0.02)
-
-        self.playing = False
-        if not self.cancel_event.is_set() or not ENABLE_BARGE_IN or protect:
-            await self.ws.send_text(json.dumps({"event": "mark", "streamSid": self.stream_sid, "mark": {"name": mark_name}}))
-            log.info(f"[tts] streamed {total} ulaw bytes to Twilio (mark={mark_name})")
-        else:
-            self.after_barge = True
-            log.info(f"[tts] aborted after {total} bytes due to barge-in")
-
-    async def enqueue_text(self, text: str, protect: bool = False):
-        now = time.monotonic()
-        min_gap = TTS_MIN_GAP_AFTER_BARGE_MS if self.after_barge else TTS_MIN_GAP_MS
-        if (now - self._last_reply_at) * 1000 < min_gap:
-            log.info("[tts] suppressed (cooldown)"); return
-        h = hash(text.strip().lower())
-        if h == self._last_hash:
-            log.info("[tts] suppressed (dedupe)"); return
-        self._last_hash = h; self._last_reply_at = now
-
-        data, fmt = await elevenlabs_tts_bytes(text)
-        ulaw = convert_elevenlabs_to_ulaw8k(data, fmt, gain_db=TTS_GAIN_DB)
-        log.info(f"[tts] reply='{text[:80]}...' fmt={fmt} -> ulaw={len(ulaw)} gain_db={TTS_GAIN_DB}")
-        if LOG_TTS_DEBUG:
-            log.info(f"[tts] queueing len={len(ulaw)}")
-        await self.q.put((ulaw, "tts-finished", protect))
-
-    async def beep(self):
-        if os.getenv("TTS_BEEP_ON_CONNECT", "0") != "1": return
-        sr = 8000; n = int(sr * 0.5); amp = int(32767 * 0.28)
-        pcm = bytearray()
-        for i in range(n):
-            s = int(amp * math.sin(2 * math.pi * 880.0 * (i / sr)))
-            pcm.extend(s.to_bytes(2, byteorder="little", signed=True))
-        ulaw = audioop.lin2ulaw(bytes(pcm), 2)
-        log.info(f"[beep] sending {len(ulaw)} ulaw bytes")
-        await self.q.put((ulaw, "beep", False))
-
-    async def close(self):
-        self._task.cancel()
-        with contextlib.suppress(Exception):
-            await self._task
-
-# ---------- WS + turn-taking ----------
+# ---------- WS ----------
 @app.websocket("/twilio/media")
 async def twilio_media_ws(ws: WebSocket):
     await ws.accept(subprotocol="audio")
-    frames = 0
-    speaker = None
-    state = DialogState()
+    frames = 0; speaker = None; recorder = None; call_sid = None
 
     def on_text(text: str, pcm: bytes):
-        nonlocal state, speaker
-        state.update_from_text(text)
-        need = state.need()
+        nonlocal speaker, recorder
+        if recorder and RECORD_CALL:
+            recorder.add_stt(text)
+        prompt = "Thanks, I hear you. What is the vehicle year, make, and model?"
+        asyncio.create_task(speaker.enqueue_text(prompt, protect=False))
 
-        if need is not None:
-            prompt = state.next_prompt()
-        else:
-            prompt = "Thank you. I have everything I need to dispatch. Stay on the line while I get your details into the system."
-
-        protect_first = (not state.first_reply_sent) and FIRST_REPLY_NO_BARGE
-        state.first_reply_sent = True
-        asyncio.create_task(speaker.enqueue_text(prompt, protect=protect_first))
-
-    stt = STTBuffer(on_text=on_text)
-    log.info("WS accepted (subprotocol=audio): /twilio/media")
+    stt = STTBuffer(on_text=on_text)  # recorder set after start
 
     try:
         while True:
             try:
                 message = await ws.receive()
             except WebSocketDisconnect:
-                log.info("WS disconnect (peer)"); break
-            except RuntimeError as e:
-                log.info(f"WS receive after disconnect: {e}"); break
+                break
+            except RuntimeError:
+                break
 
             if message["type"] == "websocket.receive":
                 payload_text = message.get("text") or (message.get("bytes") or b"").decode("utf-8","ignore")
@@ -467,37 +376,47 @@ async def twilio_media_ws(ws: WebSocket):
                 event = data.get("event")
                 if event == "start":
                     stream_sid = data.get("start", {}).get("streamSid")
-                    call_sid = data.get("start", {}).get("callSid")
-                    log.info(f"[media] start callSid={call_sid} streamSid={stream_sid}")
-                    speaker = TTSSpeaker(ws, stream_sid)
+                    call_sid = data.get("start", {}).get("callSid") or stream_sid
+                    recorder = Recorder(call_sid) if RECORD_CALL else None
+                    stt.recorder = recorder
+                    speaker = TTSSpeaker(ws, stream_sid, recorder)
                     asyncio.create_task(speaker.beep())
                     if AUTO_TEST_TTS:
                         asyncio.create_task(speaker.enqueue_text("System check. You should hear this test phrase.", protect=True))
                 elif event == "media":
                     payload_b64 = data.get("media", {}).get("payload", "")
-                    if speaker and speaker.playing and ENABLE_BARGE_IN:
-                        try:
-                            ulaw = base64.b64decode(payload_b64)
-                            lin = audioop.ulaw2lin(ulaw, BYTES_PER_SAMPLE)
-                            if _rms(lin) > VAD_RMS_THRESHOLD:
-                                speaker.cancel_event.set()
-                        except Exception:
-                            pass
                     stt.add_ulaw_b64(payload_b64)
                     frames += 1
-                    if frames % 25 == 0:
-                        log.info(f"[media] frames={frames}")
-                elif event == "mark":
-                    mark_name = data.get("mark",{}).get("name")
-                    log.info(f"[media] mark ({mark_name})")
                 elif event == "stop":
-                    log.info(f"[media] stop after frames={frames}")
                     stt.finish(); break
     finally:
         if speaker: await speaker.close()
+        if recorder and RECORD_CALL:
+            paths = recorder.finalize_files()
+            log.info(f"[record] saved: {paths}")
         try:
             if ws.application_state == WebSocketState.CONNECTED:
                 await ws.close()
         except Exception:
             pass
-        log.info("WS closed")
+
+# ---------- Download endpoints ----------
+@app.get("/recordings/{name}")
+async def get_recording(name: str):
+    base = Path(RECORD_DIR) / name
+    if not base.exists() or not base.is_file():
+        for suf in (".in.wav", ".out.wav", ".zip", ".stt.txt", ".tts.txt"):
+            cand = base.with_suffix(suf)
+            if cand.exists():
+                base = cand; break
+    if not base.exists():
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(str(base))
+
+@app.get("/debug/{call_id}")
+async def get_debug_bundle(call_id: str):
+    base = Path(RECORD_DIR) / call_id
+    zip_path = base.with_suffix(".zip")
+    if not zip_path.exists():
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(str(zip_path))
