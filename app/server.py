@@ -41,36 +41,41 @@ Path(RECORD_DIR).mkdir(parents=True, exist_ok=True)
 TWILIO_RECORD_CALL = os.getenv("TWILIO_RECORD_CALL", "0") == "1"
 
 # Endpointing
-STT_CHUNK_S = float(os.getenv("STT_CHUNK_S", "1.4"))
+STT_CHUNK_S = float(os.getenv("STT_CHUNK_S", "1.2"))
 LINEAR_BYTES_TARGET = int(SAMPLE_RATE_IN * BYTES_PER_SAMPLE * STT_CHUNK_S)
 STT_FLUSH_ON_SILENCE = os.getenv("STT_FLUSH_ON_SILENCE", "1") == "1"
-STT_MIN_MS = int(os.getenv("STT_MIN_MS", "600"))
-VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "700"))
-VAD_QUIET_MS = int(os.getenv("VAD_QUIET_MS", "250"))
-STT_RMS_GATE = int(os.getenv("STT_RMS_GATE", "350"))
-STT_MIN_GAP_BETWEEN_CALLS_MS = int(os.getenv("STT_MIN_GAP_BETWEEN_CALLS_MS", "800"))
+STT_MIN_MS = int(os.getenv("STT_MIN_MS", "400"))
+VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "260"))
+VAD_QUIET_MS = int(os.getenv("VAD_QUIET_MS", "300"))
+STT_RMS_GATE = int(os.getenv("STT_RMS_GATE", "300"))
+STT_MIN_GAP_BETWEEN_CALLS_MS = int(os.getenv("STT_MIN_GAP_BETWEEN_CALLS_MS", "1200"))
 
 # TTS
-TTS_GAIN_DB = float(os.getenv("TTS_GAIN_DB", "6"))
-TTS_PEAK_TARGET = float(os.getenv("TTS_PEAK_TARGET", "0.78"))
+TTS_GAIN_DB = float(os.getenv("TTS_GAIN_DB", "0"))
+TTS_PEAK_TARGET = float(os.getenv("TTS_PEAK_TARGET", "0.65"))
 TTS_MIN_GAP_MS = int(os.getenv("TTS_MIN_GAP_MS", "2400"))
-TTS_MIN_GAP_AFTER_BARGE_MS = int(os.getenv("TTS_MIN_GAP_AFTER_BARGE_MS", "1200"))
+TTS_MIN_GAP_AFTER_BARGE_MS = int(os.getenv("TTS_MIN_GAP_AFTER_BARGE_MS", "2200"))
 TTS_PAD_PRE_MS = int(os.getenv("TTS_PAD_PRE_MS", "700"))
 TTS_PAD_POST_MS = int(os.getenv("TTS_PAD_POST_MS", "600"))
 ELEVEN_FMT = os.getenv("ELEVENLABS_OUTPUT_FORMAT", "pcm_16000").lower()
 
 ELEVEN_LATENCY_MODE = os.getenv("ELEVEN_LATENCY_MODE", "1")
-ELEVEN_SPEED = float(os.getenv("ELEVEN_SPEED", "0.95"))
-ELEVEN_STABILITY = float(os.getenv("ELEVEN_STABILITY", "0.5"))
+ELEVEN_SPEED = float(os.getenv("ELEVEN_SPEED", "0.86"))
+ELEVEN_STABILITY = float(os.getenv("ELEVEN_STABILITY", "0.65"))
 ELEVEN_SIMILARITY = float(os.getenv("ELEVEN_SIMILARITY", "0.75"))
-ELEVEN_STYLE = float(os.getenv("ELEVEN_STYLE", "0.35"))
+ELEVEN_STYLE = float(os.getenv("ELEVEN_STYLE", "0.20"))
 ELEVEN_SPEAKER_BOOST = os.getenv("ELEVEN_SPEAKER_BOOST", "1") == "1"
 
-# Turn-taking
-FIRST_REPLY_WAIT_FOR_QUIET = os.getenv("FIRST_REPLY_WAIT_FOR_QUIET", "0") == "1"
+# Soft-barge / ducking
 ENABLE_BARGE_IN = os.getenv("ENABLE_BARGE_IN", "1") == "1"
-BARGE_GRACE_MS = int(os.getenv("BARGE_GRACE_MS", "900"))
+BARGE_GRACE_MS = int(os.getenv("BARGE_GRACE_MS", "1500"))
 FIRST_REPLY_NO_BARGE = os.getenv("FIRST_REPLY_NO_BARGE", "1") == "1"
+FIRST_REPLY_WAIT_FOR_QUIET = os.getenv("FIRST_REPLY_WAIT_FOR_QUIET", "0") == "1"
+
+TTS_BARGE_FADE_MS = int(os.getenv("TTS_BARGE_FADE_MS", "140"))         # fade-out when barge triggers
+TTS_BARGE_POST_SILENCE_MS = int(os.getenv("TTS_BARGE_POST_SILENCE_MS", "180"))  # pad of silence after stop
+TTS_DUCK_DB = float(os.getenv("TTS_DUCK_DB", "6"))                     # how much to duck while caller is talking
+TTS_DUCK_DECAY_MS = int(os.getenv("TTS_DUCK_DECAY_MS", "800"))         # how long duck lasts after last detected speech
 
 # Diagnostics
 LOG_TTS_DEBUG = os.getenv("LOG_TTS_DEBUG", "0") == "1"
@@ -80,7 +85,7 @@ WHISPER_PROMPT = os.getenv("WHISPER_PROMPT", "Towing and roadside assistance. Ye
 
 # ---------- Utils ----------
 def _public_ws_url(request: Request) -> str:
-    host = request.headers.get("x-forwarded-host") or request.url.hostname
+    host = request.headers.get("x-forwarded-host")) or request.url.hostname
     scheme = "wss"
     return f"{scheme}://{host}/twilio/media"
 
@@ -339,7 +344,7 @@ def convert_elevenlabs_to_ulaw8k(data: bytes, fmt: str, gain_db: float) -> bytes
     pre = _silence_ulaw(TTS_PAD_PRE_MS); post = _silence_ulaw(TTS_PAD_POST_MS)
     return pre + ulaw + post
 
-# ---------- Conversation state ----------
+# ---------- Conversation state (simple) ----------
 VEHICLE_MAKES = r"(ford|chevy|chevrolet|gmc|ram|dodge|toyota|honda|nissan|jeep|bmw|mercedes|benz|kia|hyundai|subaru|vw|volkswagen|audi|lexus|infiniti|acura|mazda|buick|cadillac|chrysler|lincoln|volvo|porsche|jaguar|land rover|mini|mitsubishi|tesla)"
 VEHICLE_TYPES = r"(car|truck|suv|van|pickup|tow ?truck|box ?truck)"
 LOC_HINTS = r"(nashville|tennessee|i[- ]?\d+|hwy|highway|exit|rd|road|st|street|ave|avenue|blvd|pike|tn-?\d+)"
@@ -403,7 +408,7 @@ class DialogState:
         self.prompt_rephrase_ix += 1
         return p
 
-# ---------- Outbound Speaker (records outbound) ----------
+# ---------- Outbound Speaker with soft-barge & ducking ----------
 class TTSSpeaker:
     def __init__(self, ws: WebSocket, stream_sid: str, recorder: Recorder | None):
         self.ws = ws
@@ -417,6 +422,12 @@ class TTSSpeaker:
         self.after_barge = False
         self.recorder = recorder
 
+        # ducking
+        self._duck_until = 0.0  # monotonic seconds
+
+    def duck_for(self, ms: int):
+        self._duck_until = max(self._duck_until, time.monotonic() + (ms / 1000.0))
+
     async def _worker(self):
         try:
             while True:
@@ -429,39 +440,78 @@ class TTSSpeaker:
             if LOG_TTS_DEBUG:
                 log.info("[tts-worker] cancelled")
 
+    def _apply_duck_and_fade(self, chunk: bytes, fade_gain):
+        # Apply ducking and optional fade multiplier to a 20 ms μ-law frame.
+        need_process = (fade_gain is not None) or (time.monotonic() < self._duck_until)
+        if not need_process:
+            return chunk
+        lin = audioop.ulaw2lin(chunk, 2)
+        if time.monotonic() < self._duck_until:
+            duck_factor = pow(10.0, -TTS_DUCK_DB / 20.0)
+            try:
+                lin = audioop.mul(lin, 2, duck_factor)
+            except Exception:
+                pass
+        if fade_gain is not None:
+            try:
+                lin = audioop.mul(lin, 2, float(fade_gain))
+            except Exception:
+                pass
+        return audioop.lin2ulaw(lin, 2)
+
     async def _stream_ulaw(self, ulaw: bytes, mark_name: str, protect: bool):
-        FRAME_BYTES = 160  # 20 ms
+        FRAME_BYTES = 160  # 20 ms at 8k
         total = 0
         self.playing = True
         self.cancel_event.clear()
         frames_played = 0
+
+        # Precompute fade steps if cancel_event gets set
+        fade_frames_total = max(1, int(TTS_BARGE_FADE_MS / 20))
+        post_silence_frames = int(TTS_BARGE_POST_SILENCE_MS / 20)
+
         while frames_played * FRAME_BYTES < len(ulaw):
             start = frames_played * FRAME_BYTES
             end = start + FRAME_BYTES
-            chunk = ulaw[start:end]
+            raw = ulaw[start:end]
+
+            # Should we start fading?
+            fade_gain = None
+            played_ms = frames_played * 20
+            if self.cancel_event.is_set() and ENABLE_BARGE_IN and not protect and played_ms >= BARGE_GRACE_MS:
+                # linear fade from 1.0 to 0.0 across fade_frames_total frames
+                idx = min(frames_played, fade_frames_total - 1)
+                gain = max(0.0, 1.0 - (idx / float(fade_frames_total)))
+                fade_gain = gain
+
+            chunk = self._apply_duck_and_fade(raw, fade_gain)
+
             if self.recorder and RECORD_CALL:
                 self.recorder.add_out_ulaw_chunk(chunk)
 
             payload = base64.b64encode(chunk).decode("ascii")
             msg = {"event": "media", "streamSid": self.stream_sid, "media": {"payload": payload}}
             await self.ws.send_text(json.dumps(msg))
-            total += end - start
+            total += len(chunk)
             frames_played += 1
 
-            played_ms = frames_played * 20
-            if self.cancel_event.is_set() and ENABLE_BARGE_IN and not protect and played_ms >= BARGE_GRACE_MS:
-                log.info(f"[barge] aborting playback after {played_ms} ms (grace={BARGE_GRACE_MS} ms)")
-                break
+            # If we finished fading after barge, stop early and pad silence
+            if fade_gain is not None and frames_played >= fade_frames_total:
+                if post_silence_frames > 0:
+                    pad = _silence_ulaw(post_silence_frames * 20)
+                    payload = base64.b64encode(pad).decode("ascii")
+                    await self.ws.send_text(json.dumps({"event": "media", "streamSid": self.stream_sid, "media": {"payload": payload}}))
+                    total += len(pad)
+                self.playing = False
+                self.after_barge = True
+                log.info(f"[tts] soft-barged after {total} bytes (fade {TTS_BARGE_FADE_MS} ms, pad {TTS_BARGE_POST_SILENCE_MS} ms)")
+                return
 
             await asyncio.sleep(0.02)
 
         self.playing = False
-        if not self.cancel_event.is_set() or not ENABLE_BARGE_IN or protect:
-            await self.ws.send_text(json.dumps({"event": "mark", "streamSid": self.stream_sid, "mark": {"name": mark_name}}))
-            log.info(f"[tts] streamed {total} ulaw bytes to Twilio (mark={mark_name})")
-        else:
-            self.after_barge = True
-            log.info(f"[tts] aborted after {total} bytes due to barge-in")
+        await self.ws.send_text(json.dumps({"event": "mark", "streamSid": self.stream_sid, "mark": {"name": mark_name}}))
+        log.info(f"[tts] streamed {total} ulaw bytes to Twilio (mark={mark_name})")
 
     async def enqueue_text(self, text: str, protect: bool = False):
         now = time.monotonic()
@@ -481,7 +531,7 @@ class TTSSpeaker:
 
     async def beep(self):
         if os.getenv("TTS_BEEP_ON_CONNECT", "0") != "1": return
-        sr = 8000; n = int(sr * 0.5); amp = int(32767 * 0.28)
+        sr = 8000; n = int(sr * 0.5); amp = int(32767 * 0.20)
         pcm = bytearray()
         for i in range(n):
             s = int(amp * math.sin(2 * math.pi * 880.0 * (i / sr)))
@@ -494,7 +544,7 @@ class TTSSpeaker:
         with contextlib.suppress(Exception):
             await self._task
 
-# ---------- WS + turn-taking ----------
+# ---------- WebSocket ----------
 @app.websocket("/twilio/media")
 async def twilio_media_ws(ws: WebSocket):
     await ws.accept(subprotocol="audio")
@@ -551,12 +601,13 @@ async def twilio_media_ws(ws: WebSocket):
                         asyncio.create_task(speaker.enqueue_text("System check. You should hear this test phrase.", protect=True))
                 elif event == "media":
                     payload_b64 = data.get("media", {}).get("payload", "")
-                    # barge-in detection during playback
+                    # Soft-duck when caller speaks; only hard-barge after grace
                     if speaker and speaker.playing and ENABLE_BARGE_IN:
                         try:
                             ulaw = base64.b64decode(payload_b64)
                             lin = audioop.ulaw2lin(ulaw, BYTES_PER_SAMPLE)
                             if _rms(lin) > VAD_RMS_THRESHOLD:
+                                speaker.duck_for(TTS_DUCK_DECAY_MS)
                                 speaker.cancel_event.set()
                         except Exception:
                             pass
