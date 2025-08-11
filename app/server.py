@@ -40,6 +40,10 @@ STT_MIN_MS = int(os.getenv("STT_MIN_MS", "700"))
 VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "500"))
 VAD_QUIET_MS = int(os.getenv("VAD_QUIET_MS", "250"))
 
+# New: STT gating to reduce empty Whisper calls and avoid event-loop stalls
+STT_RMS_GATE = int(os.getenv("STT_RMS_GATE", "350"))  # skip Whisper if chunk is too quiet
+STT_MIN_GAP_BETWEEN_CALLS_MS = int(os.getenv("STT_MIN_GAP_BETWEEN_CALLS_MS", "800"))
+
 # TTS loudness/flow
 TTS_GAIN_DB = float(os.getenv("TTS_GAIN_DB", "8"))
 TTS_PEAK_TARGET = float(os.getenv("TTS_PEAK_TARGET", "0.82"))
@@ -92,7 +96,7 @@ async def twilio_voice_webhook(request: Request):
 </Response>'''
     return Response(content=twiml, media_type="application/xml")
 
-# ---------- STT with adaptive endpointing ----------
+# ---------- STT with adaptive endpointing (non-blocking) ----------
 IGNORE_PATTERNS = [r"www\\.", r"http[s]?://", r"FEMA\\.gov", r"un\\.org", r"For more UN videos", r"For more information"]
 
 class STTBuffer:
@@ -101,6 +105,9 @@ class STTBuffer:
         self.inflight = False
         self.on_text = on_text
         self.last_voice_at = time.monotonic()
+        self.last_whisper_at = 0.0
+        # use current loop to schedule work without blocking playback
+        self.loop = asyncio.get_running_loop()
 
     def add_ulaw_b64(self, payload_b64: str):
         try:
@@ -118,14 +125,14 @@ class STTBuffer:
                 self.last_voice_at = now
             quiet_ms = (now - self.last_voice_at) * 1000.0
             if quiet_ms >= VAD_QUIET_MS and len(self.linear_pcm) >= max(2, int(SAMPLE_RATE_IN*BYTES_PER_SAMPLE*STT_MIN_MS/1000)):
-                self.flush_to_whisper(); return
+                self.flush_to_whisper_async(); return
 
         if len(self.linear_pcm) >= LINEAR_BYTES_TARGET:
-            self.flush_to_whisper()
+            self.flush_to_whisper_async()
 
     def finish(self):
         if self.linear_pcm and not self.inflight:
-            self.flush_to_whisper()
+            self.flush_to_whisper_async()
 
     def _to_wav_bytes(self, pcm_bytes: bytes) -> bytes:
         buf = BytesIO()
@@ -134,24 +141,39 @@ class STTBuffer:
             wf.writeframes(pcm_bytes)
         return buf.getvalue()
 
-    def flush_to_whisper(self):
+    def flush_to_whisper_async(self):
         if not self.linear_pcm or self.inflight:
             return
+        # gate by RMS and min gap
         chunk = bytes(self.linear_pcm); self.linear_pcm.clear()
-
-        if _openai_client is None:
-            log.info("[stt] (dry-run) bytes=%d", len(chunk)); return
+        rms_total = _rms(chunk)
+        now = time.monotonic()
+        if rms_total < STT_RMS_GATE:
+            log.info(f"[stt] skip (quiet) rms={rms_total}")
+            return
+        if (now - self.last_whisper_at) * 1000.0 < STT_MIN_GAP_BETWEEN_CALLS_MS:
+            log.info("[stt] skip (gap)")
+            return
 
         self.inflight = True
+        self.last_whisper_at = now
+        self.loop.create_task(self._do_whisper(chunk))
+
+    async def _do_whisper(self, chunk: bytes):
         try:
-            bio = BytesIO(self._to_wav_bytes(chunk)); bio.name = "clip.wav"; bio.seek(0)
-            resp = _openai_client.audio.transcriptions.create(
-                model="whisper-1",
-                file=bio,
-                response_format="json",
-                language="en",
-                prompt=WHISPER_PROMPT,
-            )
+            if _openai_client is None:
+                log.info("[stt] (dry-run) bytes=%d", len(chunk)); return
+            # Offload the blocking Whisper call to a thread so playback isn't stalled
+            def _call_whisper(bytes_chunk: bytes):
+                bio = BytesIO(self._to_wav_bytes(bytes_chunk)); bio.name = "clip.wav"; bio.seek(0)
+                return _openai_client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=bio,
+                    response_format="json",
+                    language="en",
+                    prompt=WHISPER_PROMPT,
+                )
+            resp = await asyncio.to_thread(_call_whisper, chunk)
             text = getattr(resp, "text", None) or (resp.get("text") if isinstance(resp, dict) else None)
             if text and len(text.strip()) >= 2 and not any(re.search(p, text, re.I) for p in IGNORE_PATTERNS):
                 log.info(f"[stt] {text}")
@@ -229,7 +251,7 @@ def convert_elevenlabs_to_ulaw8k(data: bytes, fmt: str, gain_db: float) -> bytes
     pre = _silence_ulaw(TTS_PAD_PRE_MS); post = _silence_ulaw(TTS_PAD_POST_MS)
     return pre + ulaw + post
 
-# ---------- Outbound Speaker with diagnostics ----------
+# ---------- Outbound Speaker with stronger error handling ----------
 class TTSSpeaker:
     def __init__(self, ws: WebSocket, stream_sid: str):
         self.ws = ws
@@ -248,13 +270,15 @@ class TTSSpeaker:
                 ulaw, mark_name = await self.q.get()
                 if LOG_TTS_DEBUG:
                     log.info(f"[tts-worker] dequeued len={len(ulaw)} mark={mark_name} qsize={self.q.qsize()}")
-                await self._stream_ulaw(ulaw, mark_name)
-                self.q.task_done()
+                try:
+                    await self._stream_ulaw(ulaw, mark_name)
+                except Exception as e:
+                    log.warning(f"[tts-worker] crashed: {e}")
+                finally:
+                    self.q.task_done()
         except asyncio.CancelledError:
             if LOG_TTS_DEBUG:
                 log.info("[tts-worker] cancelled")
-        except Exception as e:
-            log.warning(f"[tts-worker] crashed: {e}")
 
     async def _stream_ulaw(self, ulaw: bytes, mark_name: str):
         FRAME_BYTES = 160  # 20 ms per frame
@@ -269,7 +293,11 @@ class TTSSpeaker:
             end = start + FRAME_BYTES
             payload = base64.b64encode(ulaw[start:end]).decode("ascii")
             msg = {"event": "media", "streamSid": self.stream_sid, "media": {"payload": payload}}
-            await self.ws.send_text(json.dumps(msg))
+            try:
+                await self.ws.send_text(json.dumps(msg))
+            except Exception as e:
+                log.warning(f"[tts-stream] send failed: {e}")
+                break
             total += end - start
             frames_played += 1
 
@@ -285,8 +313,11 @@ class TTSSpeaker:
 
         self.playing = False
         if not self.cancel_event.is_set() or not ENABLE_BARGE_IN:
-            await self.ws.send_text(json.dumps({"event": "mark", "streamSid": self.stream_sid, "mark": {"name": mark_name}}))
-            log.info(f"[tts] streamed {total} ulaw bytes to Twilio (mark={mark_name})")
+            try:
+                await self.ws.send_text(json.dumps({"event": "mark", "streamSid": self.stream_sid, "mark": {"name": mark_name}}))
+                log.info(f"[tts] streamed {total} ulaw bytes to Twilio (mark={mark_name})")
+            except Exception as e:
+                log.warning(f"[tts-stream] mark send failed: {e}")
         else:
             self.after_barge = True
             log.info(f"[tts] aborted after {total} bytes due to barge-in")
