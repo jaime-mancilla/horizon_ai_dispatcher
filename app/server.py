@@ -232,7 +232,7 @@ class TTSSpeaker:
         self.q = asyncio.Queue()
         self._task = asyncio.create_task(self._worker())
         self._last_reply_at = 0.0
-               self._last_hash = None
+        self._last_hash = None
         self.playing = False
         self.cancel_event = asyncio.Event()
         self.after_barge = False
