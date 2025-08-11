@@ -85,8 +85,8 @@ WHISPER_PROMPT = os.getenv("WHISPER_PROMPT", "Towing and roadside assistance. Ye
 
 # ---------- Utils ----------
 def _public_ws_url(request: Request) -> str:
-    host = request.headers.get("x-forwarded-host")) or request.url.hostname
-    scheme = "wss"
+    host = request.headers.get("x-forwarded-host") or request.url.hostname
+    scheme = "wss" # Render is behind HTTPS; Twilio Media Stream should use wss
     return f"{scheme}://{host}/twilio/media"
 
 def _rms(pcm16: bytes) -> float:
