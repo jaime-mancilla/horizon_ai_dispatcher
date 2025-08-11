@@ -10,6 +10,7 @@ import time
 import math
 import re
 import contextlib
+import random
 
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response
@@ -33,36 +34,45 @@ SAMPLE_RATE_IN = 8000
 BYTES_PER_SAMPLE = 2
 
 # Endpointing (fast first reply)
-STT_CHUNK_S = float(os.getenv("STT_CHUNK_S", "1.6"))
+STT_CHUNK_S = float(os.getenv("STT_CHUNK_S", "1.4"))
 LINEAR_BYTES_TARGET = int(SAMPLE_RATE_IN * BYTES_PER_SAMPLE * STT_CHUNK_S)
 STT_FLUSH_ON_SILENCE = os.getenv("STT_FLUSH_ON_SILENCE", "1") == "1"
-STT_MIN_MS = int(os.getenv("STT_MIN_MS", "700"))
-VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "500"))
+STT_MIN_MS = int(os.getenv("STT_MIN_MS", "600"))
+VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "700"))
 VAD_QUIET_MS = int(os.getenv("VAD_QUIET_MS", "250"))
 
-# New: STT gating to reduce empty Whisper calls and avoid event-loop stalls
-STT_RMS_GATE = int(os.getenv("STT_RMS_GATE", "350"))  # skip Whisper if chunk is too quiet
+# STT gating
+STT_RMS_GATE = int(os.getenv("STT_RMS_GATE", "350"))
 STT_MIN_GAP_BETWEEN_CALLS_MS = int(os.getenv("STT_MIN_GAP_BETWEEN_CALLS_MS", "800"))
 
 # TTS loudness/flow
-TTS_GAIN_DB = float(os.getenv("TTS_GAIN_DB", "8"))
-TTS_PEAK_TARGET = float(os.getenv("TTS_PEAK_TARGET", "0.82"))
-TTS_MIN_GAP_MS = int(os.getenv("TTS_MIN_GAP_MS", "3200"))
-TTS_MIN_GAP_AFTER_BARGE_MS = int(os.getenv("TTS_MIN_GAP_AFTER_BARGE_MS", "900"))
-TTS_PAD_PRE_MS = int(os.getenv("TTS_PAD_PRE_MS", "220"))
-TTS_PAD_POST_MS = int(os.getenv("TTS_PAD_POST_MS", "260"))
+TTS_GAIN_DB = float(os.getenv("TTS_GAIN_DB", "6"))
+TTS_PEAK_TARGET = float(os.getenv("TTS_PEAK_TARGET", "0.78"))
+TTS_MIN_GAP_MS = int(os.getenv("TTS_MIN_GAP_MS", "2400"))
+TTS_MIN_GAP_AFTER_BARGE_MS = int(os.getenv("TTS_MIN_GAP_AFTER_BARGE_MS", "1200"))
+TTS_PAD_PRE_MS = int(os.getenv("TTS_PAD_PRE_MS", "600"))
+TTS_PAD_POST_MS = int(os.getenv("TTS_PAD_POST_MS", "500"))
 ELEVEN_FMT = os.getenv("ELEVENLABS_OUTPUT_FORMAT", "pcm_16000").lower()
 
+# ElevenLabs quality controls
+ELEVEN_LATENCY_MODE = os.getenv("ELEVEN_LATENCY_MODE", "1")  # "0","1","2","3"
+ELEVEN_SPEED = float(os.getenv("ELEVEN_SPEED", "0.95"))
+ELEVEN_STABILITY = float(os.getenv("ELEVEN_STABILITY", "0.5"))
+ELEVEN_SIMILARITY = float(os.getenv("ELEVEN_SIMILARITY", "0.75"))
+ELEVEN_STYLE = float(os.getenv("ELEVEN_STYLE", "0.35"))
+ELEVEN_SPEAKER_BOOST = os.getenv("ELEVEN_SPEAKER_BOOST", "1") == "1"
+
 # Interaction behavior
-FIRST_REPLY_WAIT_FOR_QUIET = os.getenv("FIRST_REPLY_WAIT_FOR_QUIET", "0") == "1"  # default off
+FIRST_REPLY_WAIT_FOR_QUIET = os.getenv("FIRST_REPLY_WAIT_FOR_QUIET", "0") == "1"
 ENABLE_BARGE_IN = os.getenv("ENABLE_BARGE_IN", "1") == "1"
-BARGE_GRACE_MS = int(os.getenv("BARGE_GRACE_MS", "250"))  # minimum playback before barge can cancel
+BARGE_GRACE_MS = int(os.getenv("BARGE_GRACE_MS", "900"))
+FIRST_REPLY_NO_BARGE = os.getenv("FIRST_REPLY_NO_BARGE", "1") == "1"
 
 # Diagnostics
 LOG_TTS_DEBUG = os.getenv("LOG_TTS_DEBUG", "0") == "1"
-AUTO_TEST_TTS = os.getenv("AUTO_TEST_TTS", "0") == "1"
+AUTO_TEST_TTS = os.getenv("AUTO_TEST_TTS", "0") == "0"
 
-WHISPER_PROMPT = os.getenv("WHISPER_PROMPT", "Towing and roadside assistance. Year make model, location, issue, urgency.")
+WHISPER_PROMPT = os.getenv("WHISPER_PROMPT", "Towing and roadside assistance. Year make model, location, issue, urgency. Keep transcripts concise.")
 
 # ---------- Utils ----------
 def _public_ws_url(request: Request) -> str:
@@ -96,7 +106,7 @@ async def twilio_voice_webhook(request: Request):
 </Response>'''
     return Response(content=twiml, media_type="application/xml")
 
-# ---------- STT with adaptive endpointing (non-blocking) ----------
+# ---------- STT (non-blocking) ----------
 IGNORE_PATTERNS = [r"www\\.", r"http[s]?://", r"FEMA\\.gov", r"un\\.org", r"For more UN videos", r"For more information"]
 
 class STTBuffer:
@@ -106,7 +116,6 @@ class STTBuffer:
         self.on_text = on_text
         self.last_voice_at = time.monotonic()
         self.last_whisper_at = 0.0
-        # use current loop to schedule work without blocking playback
         self.loop = asyncio.get_running_loop()
 
     def add_ulaw_b64(self, payload_b64: str):
@@ -118,7 +127,6 @@ class STTBuffer:
             return
         self.linear_pcm.extend(lin)
 
-        # Flush earlier if we detect enough + silence
         if STT_FLUSH_ON_SILENCE:
             rms = _rms(lin); now = time.monotonic()
             if rms > VAD_RMS_THRESHOLD:
@@ -144,7 +152,6 @@ class STTBuffer:
     def flush_to_whisper_async(self):
         if not self.linear_pcm or self.inflight:
             return
-        # gate by RMS and min gap
         chunk = bytes(self.linear_pcm); self.linear_pcm.clear()
         rms_total = _rms(chunk)
         now = time.monotonic()
@@ -163,7 +170,6 @@ class STTBuffer:
         try:
             if _openai_client is None:
                 log.info("[stt] (dry-run) bytes=%d", len(chunk)); return
-            # Offload the blocking Whisper call to a thread so playback isn't stalled
             def _call_whisper(bytes_chunk: bytes):
                 bio = BytesIO(self._to_wav_bytes(bytes_chunk)); bio.name = "clip.wav"; bio.seek(0)
                 return _openai_client.audio.transcriptions.create(
@@ -187,7 +193,7 @@ class STTBuffer:
         finally:
             self.inflight = False
 
-# ---------- TTS helpers (normalization + padding) ----------
+# ---------- TTS helpers ----------
 def _apply_gain_linear(frames: bytes, sampwidth: int, gain_db: float) -> bytes:
     if gain_db <= 0: return frames
     factor = pow(10.0, gain_db / 20.0)
@@ -229,14 +235,22 @@ async def elevenlabs_tts_bytes(text: str) -> tuple[bytes, str]:
     if not api_key or not voice_id: raise RuntimeError("Missing ELEVENLABS env vars")
     fmt = ELEVEN_FMT
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    params = {"optimize_streaming_latency": "2", "output_format": fmt}
+    params = {"optimize_streaming_latency": str(ELEVEN_LATENCY_MODE), "output_format": fmt}
     accept = "audio/wav" if fmt == "wav" else "audio/pcm"
     headers = {"xi-api-key": api_key, "accept": accept, "content-type": "application/json"}
+    voice_settings = {
+        "stability": ELEVEN_STABILITY,
+        "similarity_boost": ELEVEN_SIMILARITY,
+        "style": ELEVEN_STYLE,
+        "use_speaker_boost": ELEVEN_SPEAKER_BOOST,
+        "speed": ELEVEN_SPEED,
+    }
     body = {"text": text, "model_id": os.getenv("ELEVENLABS_MODEL_ID", "eleven_monolingual_v1"),
-            "voice_settings": {"stability": 0.4, "similarity_boost": 0.7}}
+            "voice_settings": voice_settings}
     async with httpx.AsyncClient(timeout=httpx.Timeout(35.0)) as client:
         r = await client.post(url, headers=headers, params=params, json=body)
-        if r.status_code != 200: raise RuntimeError(f"ElevenLabs TTS failed: {r.status_code} {r.text[:200]}")
+        if r.status_code != 200:
+            raise RuntimeError(f"ElevenLabs TTS failed: {r.status_code} {r.text[:200]}")
         return r.content, fmt
 
 def convert_elevenlabs_to_ulaw8k(data: bytes, fmt: str, gain_db: float) -> bytes:
@@ -251,7 +265,71 @@ def convert_elevenlabs_to_ulaw8k(data: bytes, fmt: str, gain_db: float) -> bytes
     pre = _silence_ulaw(TTS_PAD_PRE_MS); post = _silence_ulaw(TTS_PAD_POST_MS)
     return pre + ulaw + post
 
-# ---------- Outbound Speaker with stronger error handling ----------
+# ---------- Conversation state ----------
+VEHICLE_MAKES = r"(ford|chevy|chevrolet|gmc|ram|dodge|toyota|honda|nissan|jeep|bmw|mercedes|benz|kia|hyundai|subaru|vw|volkswagen|audi|lexus|infiniti|acura|mazda|buick|cadillac|chrysler|lincoln|volvo|porsche|jaguar|land rover|mini|mitsubishi|tesla)"
+VEHICLE_TYPES = r"(car|truck|suv|van|pickup|tow ?truck|box ?truck)"
+LOC_HINTS = r"(nashville|tennessee|i[- ]?\d+|hwy|highway|exit|rd|road|st|street|ave|avenue|blvd|pike|tn-?\d+)"
+ISSUE_HINTS = r"(flat|tire|battery|dead|won'?t start|no start|engine|overheat|overheating|accident|lock(ed)? out|fuel|gas|out of gas|tow|winch|ditch|stuck)"
+
+class DialogState:
+    def __init__(self):
+        self.vehicle = False
+        self.location = False
+        self.issue = False
+        self.urgency = False
+        self.first_reply_sent = False
+        self.prompt_rephrase_ix = 0
+
+    def update_from_text(self, text: str):
+        t = text.lower()
+        if re.search(r"\b(20\d{2}|19\d{2})\b", t) or re.search(VEHICLE_MAKES, t) or re.search(VEHICLE_TYPES, t):
+            self.vehicle = True
+        if re.search(LOC_HINTS, t):
+            self.location = True
+        if re.search(ISSUE_HINTS, t):
+            self.issue = True
+        if re.search(r"(right now|asap|urgent|immediately|today|tonight|this (morning|evening)|blocking|in traffic)", t):
+            self.urgency = True
+
+    def need(self):
+        if not self.vehicle: return "vehicle"
+        if not self.location: return "location"
+        if not self.issue: return "issue"
+        if not self.urgency: return "urgency"
+        return None
+
+    def next_prompt(self):
+        need = self.need()
+        if need is None:
+            return "Thanks. I can get a truck headed your way. What’s a good callback number in case we get disconnected?"
+        options = {
+            "vehicle": [
+                "Thanks, I hear you. What is the vehicle year, make, and model?",
+                "Got it. Can you tell me the vehicle year, make, and model?",
+                "Okay. What are the year, make, and model of the vehicle?"
+            ],
+            "location": [
+                "Where are you exactly—an address, intersection, or nearby business?",
+                "What’s your exact location or the nearest cross-street?",
+                "Tell me where the vehicle is—an address or a landmark works."
+            ],
+            "issue": [
+                "What happened with the vehicle—flat tire, won’t start, accident, or something else?",
+                "What seems to be the issue with the vehicle?",
+                "Tell me what’s going on with the vehicle so we send the right truck."
+            ],
+            "urgency": [
+                "Is this urgent right now, or is the vehicle in a safe spot?",
+                "Do you need help immediately, or can it wait a bit?",
+                "How urgent is it—are you blocking traffic or in a safe place?"
+            ]
+        }
+        arr = options[need]
+        p = arr[self.prompt_rephrase_ix % len(arr)]
+        self.prompt_rephrase_ix += 1
+        return p
+
+# ---------- Outbound Speaker ----------
 class TTSSpeaker:
     def __init__(self, ws: WebSocket, stream_sid: str):
         self.ws = ws
@@ -267,42 +345,34 @@ class TTSSpeaker:
     async def _worker(self):
         try:
             while True:
-                ulaw, mark_name = await self.q.get()
+                ulaw, mark_name, protect = await self.q.get()
                 if LOG_TTS_DEBUG:
-                    log.info(f"[tts-worker] dequeued len={len(ulaw)} mark={mark_name} qsize={self.q.qsize()}")
-                try:
-                    await self._stream_ulaw(ulaw, mark_name)
-                except Exception as e:
-                    log.warning(f"[tts-worker] crashed: {e}")
-                finally:
-                    self.q.task_done()
+                    log.info(f"[tts-worker] dequeued len={len(ulaw)} mark={mark_name} protect={protect} qsize={self.q.qsize()}")
+                await self._stream_ulaw(ulaw, mark_name, protect)
+                self.q.task_done()
         except asyncio.CancelledError:
             if LOG_TTS_DEBUG:
                 log.info("[tts-worker] cancelled")
 
-    async def _stream_ulaw(self, ulaw: bytes, mark_name: str):
-        FRAME_BYTES = 160  # 20 ms per frame
+    async def _stream_ulaw(self, ulaw: bytes, mark_name: str, protect: bool):
+        FRAME_BYTES = 160  # 20 ms
         total = 0
         self.playing = True
         self.cancel_event.clear()
         frames_played = 0
         if LOG_TTS_DEBUG:
-            log.info(f"[tts-stream] start bytes={len(ulaw)} grace={BARGE_GRACE_MS}ms barge={ENABLE_BARGE_IN}")
+            log.info(f"[tts-stream] start bytes={len(ulaw)} grace={BARGE_GRACE_MS}ms barge={ENABLE_BARGE_IN} protect={protect}")
         while frames_played * FRAME_BYTES < len(ulaw):
             start = frames_played * FRAME_BYTES
             end = start + FRAME_BYTES
             payload = base64.b64encode(ulaw[start:end]).decode("ascii")
             msg = {"event": "media", "streamSid": self.stream_sid, "media": {"payload": payload}}
-            try:
-                await self.ws.send_text(json.dumps(msg))
-            except Exception as e:
-                log.warning(f"[tts-stream] send failed: {e}")
-                break
+            await self.ws.send_text(json.dumps(msg))
             total += end - start
             frames_played += 1
 
             played_ms = frames_played * 20
-            if self.cancel_event.is_set() and ENABLE_BARGE_IN and played_ms >= BARGE_GRACE_MS:
+            if self.cancel_event.is_set() and ENABLE_BARGE_IN and not protect and played_ms >= BARGE_GRACE_MS:
                 log.info(f"[barge] aborting playback after {played_ms} ms (grace={BARGE_GRACE_MS} ms)")
                 break
 
@@ -312,17 +382,14 @@ class TTSSpeaker:
             await asyncio.sleep(0.02)
 
         self.playing = False
-        if not self.cancel_event.is_set() or not ENABLE_BARGE_IN:
-            try:
-                await self.ws.send_text(json.dumps({"event": "mark", "streamSid": self.stream_sid, "mark": {"name": mark_name}}))
-                log.info(f"[tts] streamed {total} ulaw bytes to Twilio (mark={mark_name})")
-            except Exception as e:
-                log.warning(f"[tts-stream] mark send failed: {e}")
+        if not self.cancel_event.is_set() or not ENABLE_BARGE_IN or protect:
+            await self.ws.send_text(json.dumps({"event": "mark", "streamSid": self.stream_sid, "mark": {"name": mark_name}}))
+            log.info(f"[tts] streamed {total} ulaw bytes to Twilio (mark={mark_name})")
         else:
             self.after_barge = True
             log.info(f"[tts] aborted after {total} bytes due to barge-in")
 
-    async def enqueue_text(self, text: str):
+    async def enqueue_text(self, text: str, protect: bool = False):
         now = time.monotonic()
         min_gap = TTS_MIN_GAP_AFTER_BARGE_MS if self.after_barge else TTS_MIN_GAP_MS
         if (now - self._last_reply_at) * 1000 < min_gap:
@@ -334,10 +401,10 @@ class TTSSpeaker:
 
         data, fmt = await elevenlabs_tts_bytes(text)
         ulaw = convert_elevenlabs_to_ulaw8k(data, fmt, gain_db=TTS_GAIN_DB)
-        log.info(f"[tts] reply='{text[:60]}...' fmt={fmt} bytes_in={len(data)} -> ulaw={len(ulaw)} gain_db={TTS_GAIN_DB}")
+        log.info(f"[tts] reply='{text[:80]}...' fmt={fmt} -> ulaw={len(ulaw)} gain_db={TTS_GAIN_DB}")
         if LOG_TTS_DEBUG:
             log.info(f"[tts] queueing len={len(ulaw)}")
-        await self.q.put((ulaw, "tts-finished"))
+        await self.q.put((ulaw, "tts-finished", protect))
 
     async def beep(self):
         if os.getenv("TTS_BEEP_ON_CONNECT", "0") != "1": return
@@ -348,27 +415,34 @@ class TTSSpeaker:
             pcm.extend(s.to_bytes(2, byteorder="little", signed=True))
         ulaw = audioop.lin2ulaw(bytes(pcm), 2)
         log.info(f"[beep] sending {len(ulaw)} ulaw bytes")
-        await self.q.put((ulaw, "beep"))
+        await self.q.put((ulaw, "beep", False))
 
     async def close(self):
         self._task.cancel()
         with contextlib.suppress(Exception):
             await self._task
 
-# ---------- WebSocket ----------
+# ---------- WS + turn-taking ----------
 @app.websocket("/twilio/media")
 async def twilio_media_ws(ws: WebSocket):
     await ws.accept(subprotocol="audio")
-    frames = 0; stream_sid = None; speaker = None
-    first_reply_sent = False
+    frames = 0
+    speaker = None
+    state = DialogState()
 
     def on_text(text: str, pcm: bytes):
-        nonlocal first_reply_sent, speaker
-        if not first_reply_sent:
-            first_reply_sent = True
-            asyncio.create_task(speaker.enqueue_text("Thanks, I hear you. What is the vehicle year, make, and model?"))
-            return
-        asyncio.create_task(speaker.enqueue_text("Could you also tell me your exact location?"))
+        nonlocal state, speaker
+        state.update_from_text(text)
+        need = state.need()
+
+        if need is not None:
+            prompt = state.next_prompt()
+        else:
+            prompt = "Thank you. I have everything I need to dispatch. Stay on the line while I get your details into the system."
+
+        protect_first = (not state.first_reply_sent) and FIRST_REPLY_NO_BARGE
+        state.first_reply_sent = True
+        asyncio.create_task(speaker.enqueue_text(prompt, protect=protect_first))
 
     stt = STTBuffer(on_text=on_text)
     log.info("WS accepted (subprotocol=audio): /twilio/media")
@@ -398,7 +472,7 @@ async def twilio_media_ws(ws: WebSocket):
                     speaker = TTSSpeaker(ws, stream_sid)
                     asyncio.create_task(speaker.beep())
                     if AUTO_TEST_TTS:
-                        asyncio.create_task(speaker.enqueue_text("System check. You should hear this test phrase."))
+                        asyncio.create_task(speaker.enqueue_text("System check. You should hear this test phrase.", protect=True))
                 elif event == "media":
                     payload_b64 = data.get("media", {}).get("payload", "")
                     if speaker and speaker.playing and ENABLE_BARGE_IN:
@@ -411,15 +485,16 @@ async def twilio_media_ws(ws: WebSocket):
                             pass
                     stt.add_ulaw_b64(payload_b64)
                     frames += 1
-                    if frames % 25 == 0: log.info(f"[media] frames={frames}")
+                    if frames % 25 == 0:
+                        log.info(f"[media] frames={frames}")
                 elif event == "mark":
-                    log.info(f"[media] other event: mark ({data.get('mark',{}).get('name')})")
+                    mark_name = data.get("mark",{}).get("name")
+                    log.info(f"[media] mark ({mark_name})")
                 elif event == "stop":
                     log.info(f"[media] stop after frames={frames}")
                     stt.finish(); break
     finally:
-        if speaker:
-            await speaker.close()
+        if speaker: await speaker.close()
         try:
             if ws.application_state == WebSocketState.CONNECTED:
                 await ws.close()
