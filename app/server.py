@@ -54,6 +54,10 @@ FIRST_REPLY_WAIT_FOR_QUIET = os.getenv("FIRST_REPLY_WAIT_FOR_QUIET", "0") == "1"
 ENABLE_BARGE_IN = os.getenv("ENABLE_BARGE_IN", "1") == "1"
 BARGE_GRACE_MS = int(os.getenv("BARGE_GRACE_MS", "250"))  # minimum playback before barge can cancel
 
+# Diagnostics
+LOG_TTS_DEBUG = os.getenv("LOG_TTS_DEBUG", "0") == "1"
+AUTO_TEST_TTS = os.getenv("AUTO_TEST_TTS", "0") == "1"
+
 WHISPER_PROMPT = os.getenv("WHISPER_PROMPT", "Towing and roadside assistance. Year make model, location, issue, urgency.")
 
 # ---------- Utils ----------
@@ -225,10 +229,11 @@ def convert_elevenlabs_to_ulaw8k(data: bytes, fmt: str, gain_db: float) -> bytes
     pre = _silence_ulaw(TTS_PAD_PRE_MS); post = _silence_ulaw(TTS_PAD_POST_MS)
     return pre + ulaw + post
 
-# ---------- Outbound Speaker with barge-in grace ----------
+# ---------- Outbound Speaker with diagnostics ----------
 class TTSSpeaker:
     def __init__(self, ws: WebSocket, stream_sid: str):
-        self.ws = ws; self.stream_sid = stream_sid
+        self.ws = ws
+        self.stream_sid = stream_sid
         self.q = asyncio.Queue()
         self._task = asyncio.create_task(self._worker())
         self._last_reply_at = 0.0
@@ -241,10 +246,15 @@ class TTSSpeaker:
         try:
             while True:
                 ulaw, mark_name = await self.q.get()
+                if LOG_TTS_DEBUG:
+                    log.info(f"[tts-worker] dequeued len={len(ulaw)} mark={mark_name} qsize={self.q.qsize()}")
                 await self._stream_ulaw(ulaw, mark_name)
                 self.q.task_done()
         except asyncio.CancelledError:
-            pass
+            if LOG_TTS_DEBUG:
+                log.info("[tts-worker] cancelled")
+        except Exception as e:
+            log.warning(f"[tts-worker] crashed: {e}")
 
     async def _stream_ulaw(self, ulaw: bytes, mark_name: str):
         FRAME_BYTES = 160  # 20 ms per frame
@@ -252,6 +262,8 @@ class TTSSpeaker:
         self.playing = True
         self.cancel_event.clear()
         frames_played = 0
+        if LOG_TTS_DEBUG:
+            log.info(f"[tts-stream] start bytes={len(ulaw)} grace={BARGE_GRACE_MS}ms barge={ENABLE_BARGE_IN}")
         while frames_played * FRAME_BYTES < len(ulaw):
             start = frames_played * FRAME_BYTES
             end = start + FRAME_BYTES
@@ -261,11 +273,13 @@ class TTSSpeaker:
             total += end - start
             frames_played += 1
 
-            # Allow barge-in cancellation only after grace window
             played_ms = frames_played * 20
             if self.cancel_event.is_set() and ENABLE_BARGE_IN and played_ms >= BARGE_GRACE_MS:
                 log.info(f"[barge] aborting playback after {played_ms} ms (grace={BARGE_GRACE_MS} ms)")
                 break
+
+            if LOG_TTS_DEBUG and frames_played % 25 == 0:
+                log.info(f"[tts-stream] frames={frames_played} sent={total}")
 
             await asyncio.sleep(0.02)
 
@@ -290,6 +304,8 @@ class TTSSpeaker:
         data, fmt = await elevenlabs_tts_bytes(text)
         ulaw = convert_elevenlabs_to_ulaw8k(data, fmt, gain_db=TTS_GAIN_DB)
         log.info(f"[tts] reply='{text[:60]}...' fmt={fmt} bytes_in={len(data)} -> ulaw={len(ulaw)} gain_db={TTS_GAIN_DB}")
+        if LOG_TTS_DEBUG:
+            log.info(f"[tts] queueing len={len(ulaw)}")
         await self.q.put((ulaw, "tts-finished"))
 
     async def beep(self):
@@ -317,12 +333,10 @@ async def twilio_media_ws(ws: WebSocket):
 
     def on_text(text: str, pcm: bytes):
         nonlocal first_reply_sent, speaker
-        # Always send the first reply
         if not first_reply_sent:
             first_reply_sent = True
             asyncio.create_task(speaker.enqueue_text("Thanks, I hear you. What is the vehicle year, make, and model?"))
             return
-        # Don't gate on 'quiet' here — let barge-in handle interruptions
         asyncio.create_task(speaker.enqueue_text("Could you also tell me your exact location?"))
 
     stt = STTBuffer(on_text=on_text)
@@ -352,9 +366,10 @@ async def twilio_media_ws(ws: WebSocket):
                     log.info(f"[media] start callSid={call_sid} streamSid={stream_sid}")
                     speaker = TTSSpeaker(ws, stream_sid)
                     asyncio.create_task(speaker.beep())
+                    if AUTO_TEST_TTS:
+                        asyncio.create_task(speaker.enqueue_text("System check. You should hear this test phrase."))
                 elif event == "media":
                     payload_b64 = data.get("media", {}).get("payload", "")
-                    # barge-in detection
                     if speaker and speaker.playing and ENABLE_BARGE_IN:
                         try:
                             ulaw = base64.b64decode(payload_b64)
@@ -372,6 +387,11 @@ async def twilio_media_ws(ws: WebSocket):
                     log.info(f"[media] stop after frames={frames}")
                     stt.finish(); break
     finally:
-        if speaker: await speaker.close()
-        if ws.application_state == WebSocketState.CONNECTED: await ws.close()
+        if speaker:
+            await speaker.close()
+        try:
+            if ws.application_state == WebSocketState.CONNECTED:
+                await ws.close()
+        except Exception:
+            pass
         log.info("WS closed")
