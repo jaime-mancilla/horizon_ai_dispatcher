@@ -18,7 +18,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, 
 from fastapi.responses import PlainTextResponse, FileResponse
 from starlette.websockets import WebSocketState
 
-# OpenAI SDK (v1+) for Whisper
+# OpenAI SDK (v1+)
 try:
     from openai import OpenAI
     _openai_client = OpenAI()
@@ -38,6 +38,7 @@ BYTES_PER_SAMPLE = 2
 RECORD_CALL = os.getenv("RECORD_CALL", "0") == "1"
 RECORD_DIR = os.getenv("RECORD_DIR", "/tmp/recordings")
 Path(RECORD_DIR).mkdir(parents=True, exist_ok=True)
+TWILIO_RECORD_CALL = os.getenv("TWILIO_RECORD_CALL", "0") == "1"
 
 # Endpointing
 STT_CHUNK_S = float(os.getenv("STT_CHUNK_S", "1.4"))
@@ -54,8 +55,8 @@ TTS_GAIN_DB = float(os.getenv("TTS_GAIN_DB", "6"))
 TTS_PEAK_TARGET = float(os.getenv("TTS_PEAK_TARGET", "0.78"))
 TTS_MIN_GAP_MS = int(os.getenv("TTS_MIN_GAP_MS", "2400"))
 TTS_MIN_GAP_AFTER_BARGE_MS = int(os.getenv("TTS_MIN_GAP_AFTER_BARGE_MS", "1200"))
-TTS_PAD_PRE_MS = int(os.getenv("TTS_PAD_PRE_MS", "600"))
-TTS_PAD_POST_MS = int(os.getenv("TTS_PAD_POST_MS", "500"))
+TTS_PAD_PRE_MS = int(os.getenv("TTS_PAD_PRE_MS", "700"))
+TTS_PAD_POST_MS = int(os.getenv("TTS_PAD_POST_MS", "600"))
 ELEVEN_FMT = os.getenv("ELEVENLABS_OUTPUT_FORMAT", "pcm_16000").lower()
 
 ELEVEN_LATENCY_MODE = os.getenv("ELEVEN_LATENCY_MODE", "1")
@@ -76,16 +77,12 @@ LOG_TTS_DEBUG = os.getenv("LOG_TTS_DEBUG", "0") == "1"
 AUTO_TEST_TTS = os.getenv("AUTO_TEST_TTS", "0") == "0"
 
 WHISPER_PROMPT = os.getenv("WHISPER_PROMPT", "Towing and roadside assistance. Year make model, location, issue, urgency. Keep transcripts concise.")
-TWILIO_RECORD_CALL = os.getenv("TWILIO_RECORD_CALL", "0") == "1"
 
 # ---------- Utils ----------
 def _public_ws_url(request: Request) -> str:
     host = request.headers.get("x-forwarded-host") or request.url.hostname
     scheme = "wss"
     return f"{scheme}://{host}/twilio/media"
-
-def _public_host(request: Request) -> str:
-    return request.headers.get("x-forwarded-host") or request.url.hostname
 
 def _rms(pcm16: bytes) -> float:
     try:
@@ -97,7 +94,7 @@ def _silence_ulaw(ms: int) -> bytes:
     samples = int(8000 * ms / 1000)
     return bytes([0xFF]) * samples  # μ-law silence byte
 
-def _to_wav(path, pcm16: bytes, sr: int = 8000):
+def _to_wav(path: Path, pcm16: bytes, sr: int = 8000):
     with wave.open(str(path), "wb") as wf:
         wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sr)
         wf.writeframes(pcm16)
@@ -111,6 +108,7 @@ async def healthz():
 async def twilio_voice_webhook(request: Request):
     ws_url = _public_ws_url(request)
     start_record = "<Start><Recording/></Start>" if TWILIO_RECORD_CALL else ""
+    log.info(f"Returning TwiML with Media Stream URL: {ws_url}")
     twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   {start_record}
@@ -311,15 +309,15 @@ async def elevenlabs_tts_bytes(text: str) -> tuple[bytes, str]:
     if not api_key or not voice_id: raise RuntimeError("Missing ELEVENLABS env vars")
     fmt = ELEVEN_FMT
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    params = {"optimize_streaming_latency": os.getenv("ELEVEN_LATENCY_MODE", "1"), "output_format": fmt}
+    params = {"optimize_streaming_latency": str(ELEVEN_LATENCY_MODE), "output_format": fmt}
     accept = "audio/wav" if fmt == "wav" else "audio/pcm"
     headers = {"xi-api-key": api_key, "accept": accept, "content-type": "application/json"}
     voice_settings = {
-        "stability": float(os.getenv("ELEVEN_STABILITY", "0.5")),
-        "similarity_boost": float(os.getenv("ELEVEN_SIMILARITY", "0.75")),
-        "style": float(os.getenv("ELEVEN_STYLE", "0.35")),
-        "use_speaker_boost": os.getenv("ELEVEN_SPEAKER_BOOST", "1") == "1",
-        "speed": float(os.getenv("ELEVEN_SPEED", "0.95")),
+        "stability": ELEVEN_STABILITY,
+        "similarity_boost": ELEVEN_SIMILARITY,
+        "style": ELEVEN_STYLE,
+        "use_speaker_boost": ELEVEN_SPEAKER_BOOST,
+        "speed": ELEVEN_SPEED,
     }
     body = {"text": text, "model_id": os.getenv("ELEVENLABS_MODEL_ID", "eleven_monolingual_v1"),
             "voice_settings": voice_settings}
@@ -341,29 +339,196 @@ def convert_elevenlabs_to_ulaw8k(data: bytes, fmt: str, gain_db: float) -> bytes
     pre = _silence_ulaw(TTS_PAD_PRE_MS); post = _silence_ulaw(TTS_PAD_POST_MS)
     return pre + ulaw + post
 
-# ---------- WS ----------
+# ---------- Conversation state ----------
+VEHICLE_MAKES = r"(ford|chevy|chevrolet|gmc|ram|dodge|toyota|honda|nissan|jeep|bmw|mercedes|benz|kia|hyundai|subaru|vw|volkswagen|audi|lexus|infiniti|acura|mazda|buick|cadillac|chrysler|lincoln|volvo|porsche|jaguar|land rover|mini|mitsubishi|tesla)"
+VEHICLE_TYPES = r"(car|truck|suv|van|pickup|tow ?truck|box ?truck)"
+LOC_HINTS = r"(nashville|tennessee|i[- ]?\d+|hwy|highway|exit|rd|road|st|street|ave|avenue|blvd|pike|tn-?\d+)"
+ISSUE_HINTS = r"(flat|tire|battery|dead|won'?t start|no start|engine|overheat|overheating|accident|lock(ed)? out|fuel|gas|out of gas|tow|winch|ditch|stuck)"
+
+class DialogState:
+    def __init__(self):
+        self.vehicle = False
+        self.location = False
+        self.issue = False
+        self.urgency = False
+        self.first_reply_sent = False
+        self.prompt_rephrase_ix = 0
+
+    def update_from_text(self, text: str):
+        t = text.lower()
+        if re.search(r"\b(20\d{2}|19\d{2})\b", t) or re.search(VEHICLE_MAKES, t) or re.search(VEHICLE_TYPES, t):
+            self.vehicle = True
+        if re.search(LOC_HINTS, t):
+            self.location = True
+        if re.search(ISSUE_HINTS, t):
+            self.issue = True
+        if re.search(r"(right now|asap|urgent|immediately|today|tonight|this (morning|evening)|blocking|in traffic)", t):
+            self.urgency = True
+
+    def need(self):
+        if not self.vehicle: return "vehicle"
+        if not self.location: return "location"
+        if not self.issue: return "issue"
+        if not self.urgency: return "urgency"
+        return None
+
+    def next_prompt(self):
+        need = self.need()
+        if need is None:
+            return "Thanks. I can get a truck headed your way. What’s a good callback number in case we get disconnected?"
+        options = {
+            "vehicle": [
+                "Thanks, I hear you. What is the vehicle year, make, and model?",
+                "Got it. Can you tell me the vehicle year, make, and model?",
+                "Okay. What are the year, make, and model of the vehicle?"
+            ],
+            "location": [
+                "Where are you exactly—an address, intersection, or nearby business?",
+                "What’s your exact location or the nearest cross-street?",
+                "Tell me where the vehicle is—an address or a landmark works."
+            ],
+            "issue": [
+                "What happened with the vehicle—flat tire, won’t start, accident, or something else?",
+                "What seems to be the issue with the vehicle?",
+                "Tell me what’s going on with the vehicle so we send the right truck."
+            ],
+            "urgency": [
+                "Is this urgent right now, or is the vehicle in a safe spot?",
+                "Do you need help immediately, or can it wait a bit?",
+                "How urgent is it—are you blocking traffic or in a safe place?"
+            ]
+        }
+        arr = options[need]
+        p = arr[self.prompt_rephrase_ix % len(arr)]
+        self.prompt_rephrase_ix += 1
+        return p
+
+# ---------- Outbound Speaker (records outbound) ----------
+class TTSSpeaker:
+    def __init__(self, ws: WebSocket, stream_sid: str, recorder: Recorder | None):
+        self.ws = ws
+        self.stream_sid = stream_sid
+        self.q = asyncio.Queue()
+        self._task = asyncio.create_task(self._worker())
+        self._last_reply_at = 0.0
+        self._last_hash = None
+        self.playing = False
+        self.cancel_event = asyncio.Event()
+        self.after_barge = False
+        self.recorder = recorder
+
+    async def _worker(self):
+        try:
+            while True:
+                ulaw, mark_name, protect, plain_text = await self.q.get()
+                if LOG_TTS_DEBUG:
+                    log.info(f"[tts-worker] dequeued len={len(ulaw)} mark={mark_name} protect={protect} qsize={self.q.qsize()}")
+                await self._stream_ulaw(ulaw, mark_name, protect)
+                self.q.task_done()
+        except asyncio.CancelledError:
+            if LOG_TTS_DEBUG:
+                log.info("[tts-worker] cancelled")
+
+    async def _stream_ulaw(self, ulaw: bytes, mark_name: str, protect: bool):
+        FRAME_BYTES = 160  # 20 ms
+        total = 0
+        self.playing = True
+        self.cancel_event.clear()
+        frames_played = 0
+        while frames_played * FRAME_BYTES < len(ulaw):
+            start = frames_played * FRAME_BYTES
+            end = start + FRAME_BYTES
+            chunk = ulaw[start:end]
+            if self.recorder and RECORD_CALL:
+                self.recorder.add_out_ulaw_chunk(chunk)
+
+            payload = base64.b64encode(chunk).decode("ascii")
+            msg = {"event": "media", "streamSid": self.stream_sid, "media": {"payload": payload}}
+            await self.ws.send_text(json.dumps(msg))
+            total += end - start
+            frames_played += 1
+
+            played_ms = frames_played * 20
+            if self.cancel_event.is_set() and ENABLE_BARGE_IN and not protect and played_ms >= BARGE_GRACE_MS:
+                log.info(f"[barge] aborting playback after {played_ms} ms (grace={BARGE_GRACE_MS} ms)")
+                break
+
+            await asyncio.sleep(0.02)
+
+        self.playing = False
+        if not self.cancel_event.is_set() or not ENABLE_BARGE_IN or protect:
+            await self.ws.send_text(json.dumps({"event": "mark", "streamSid": self.stream_sid, "mark": {"name": mark_name}}))
+            log.info(f"[tts] streamed {total} ulaw bytes to Twilio (mark={mark_name})")
+        else:
+            self.after_barge = True
+            log.info(f"[tts] aborted after {total} bytes due to barge-in")
+
+    async def enqueue_text(self, text: str, protect: bool = False):
+        now = time.monotonic()
+        min_gap = TTS_MIN_GAP_AFTER_BARGE_MS if self.after_barge else TTS_MIN_GAP_MS
+        if (now - self._last_reply_at) * 1000 < min_gap:
+            log.info("[tts] suppressed (cooldown)"); return
+        h = hash(text.strip().lower())
+        if h == self._last_hash:
+            log.info("[tts] suppressed (dedupe)"); return
+        self._last_hash = h; self._last_reply_at = now
+
+        data, fmt = await elevenlabs_tts_bytes(text)
+        ulaw = convert_elevenlabs_to_ulaw8k(data, fmt, gain_db=TTS_GAIN_DB)
+        if self.recorder and RECORD_CALL:
+            self.recorder.add_tts(text)
+        await self.q.put((ulaw, "tts-finished", protect, text))
+
+    async def beep(self):
+        if os.getenv("TTS_BEEP_ON_CONNECT", "0") != "1": return
+        sr = 8000; n = int(sr * 0.5); amp = int(32767 * 0.28)
+        pcm = bytearray()
+        for i in range(n):
+            s = int(amp * math.sin(2 * math.pi * 880.0 * (i / sr)))
+            pcm.extend(s.to_bytes(2, byteorder="little", signed=True))
+        ulaw = audioop.lin2ulaw(bytes(pcm), 2)
+        await self.q.put((ulaw, "beep", False, ""))
+
+    async def close(self):
+        self._task.cancel()
+        with contextlib.suppress(Exception):
+            await self._task
+
+# ---------- WS + turn-taking ----------
 @app.websocket("/twilio/media")
 async def twilio_media_ws(ws: WebSocket):
     await ws.accept(subprotocol="audio")
-    frames = 0; speaker = None; recorder = None; call_sid = None
+    frames = 0
+    speaker = None
+    state = DialogState()
+    recorder = None
+    call_sid = None
 
     def on_text(text: str, pcm: bytes):
-        nonlocal speaker, recorder
-        if recorder and RECORD_CALL:
-            recorder.add_stt(text)
-        prompt = "Thanks, I hear you. What is the vehicle year, make, and model?"
-        asyncio.create_task(speaker.enqueue_text(prompt, protect=False))
+        nonlocal state, speaker, recorder
+        state.update_from_text(text)
+        need = state.need()
 
-    stt = STTBuffer(on_text=on_text)  # recorder set after start
+        if need is not None:
+            prompt = state.next_prompt()
+        else:
+            prompt = "Thanks. I can get a truck headed your way. What’s a good callback number in case we get disconnected?"
+
+        protect_first = (not state.first_reply_sent) and FIRST_REPLY_NO_BARGE
+        state.first_reply_sent = True
+        asyncio.create_task(speaker.enqueue_text(prompt, protect=protect_first))
+
+    stt = STTBuffer(on_text=on_text)  # set recorder after 'start'
+    log.info("WS accepted (subprotocol=audio): /twilio/media")
 
     try:
         while True:
             try:
                 message = await ws.receive()
             except WebSocketDisconnect:
-                break
-            except RuntimeError:
-                break
+                log.info("WS disconnect (peer)"); break
+            except RuntimeError as e:
+                log.info(f"WS receive after disconnect: {e}"); break
 
             if message["type"] == "websocket.receive":
                 payload_text = message.get("text") or (message.get("bytes") or b"").decode("utf-8","ignore")
@@ -377,6 +542,7 @@ async def twilio_media_ws(ws: WebSocket):
                 if event == "start":
                     stream_sid = data.get("start", {}).get("streamSid")
                     call_sid = data.get("start", {}).get("callSid") or stream_sid
+                    log.info(f"[media] start callSid={call_sid} streamSid={stream_sid}")
                     recorder = Recorder(call_sid) if RECORD_CALL else None
                     stt.recorder = recorder
                     speaker = TTSSpeaker(ws, stream_sid, recorder)
@@ -385,9 +551,23 @@ async def twilio_media_ws(ws: WebSocket):
                         asyncio.create_task(speaker.enqueue_text("System check. You should hear this test phrase.", protect=True))
                 elif event == "media":
                     payload_b64 = data.get("media", {}).get("payload", "")
+                    # barge-in detection during playback
+                    if speaker and speaker.playing and ENABLE_BARGE_IN:
+                        try:
+                            ulaw = base64.b64decode(payload_b64)
+                            lin = audioop.ulaw2lin(ulaw, BYTES_PER_SAMPLE)
+                            if _rms(lin) > VAD_RMS_THRESHOLD:
+                                speaker.cancel_event.set()
+                        except Exception:
+                            pass
                     stt.add_ulaw_b64(payload_b64)
                     frames += 1
+                    if frames % 25 == 0:
+                        log.info(f"[media] frames={frames}")
+                elif event == "mark":
+                    pass
                 elif event == "stop":
+                    log.info(f"[media] stop after frames={frames}")
                     stt.finish(); break
     finally:
         if speaker: await speaker.close()
@@ -399,8 +579,9 @@ async def twilio_media_ws(ws: WebSocket):
                 await ws.close()
         except Exception:
             pass
+        log.info("WS closed")
 
-# ---------- Download endpoints ----------
+# ---------- Artifact download endpoints ----------
 @app.get("/recordings/{name}")
 async def get_recording(name: str):
     base = Path(RECORD_DIR) / name
