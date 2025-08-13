@@ -4,3 +4,4 @@ httpx
 python-dotenv
 PyYAML
 twilio
+openai>=1.30.0
