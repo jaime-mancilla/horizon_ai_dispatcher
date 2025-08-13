@@ -309,7 +309,7 @@ def _to_ulaw_8k_from_linear(frames: bytes, sw: int, sr: int, nch: int, gain_db: 
     if gain_db > 0: frames = _apply_gain_linear(frames, 2, gain_db)
     return audioop.lin2ulaw(frames, 2)
 
-async def elevenlabs_tts_bytes(text: str) -> tuple[bytes, str]:
+async def elevenlabs_tts_bytes(text: str, speed: float | None = None, style: float | None = None) -> tuple[bytes, str]:
     api_key = os.getenv("ELEVENLABS_API_KEY"); voice_id = os.getenv("ELEVENLABS_VOICE_ID")
     if not api_key or not voice_id: raise RuntimeError("Missing ELEVENLABS env vars")
     fmt = ELEVEN_FMT
@@ -320,9 +320,9 @@ async def elevenlabs_tts_bytes(text: str) -> tuple[bytes, str]:
     voice_settings = {
         "stability": ELEVEN_STABILITY,
         "similarity_boost": ELEVEN_SIMILARITY,
-        "style": ELEVEN_STYLE,
+        "style": (style if style is not None else ELEVEN_STYLE),
         "use_speaker_boost": ELEVEN_SPEAKER_BOOST,
-        "speed": ELEVEN_SPEED,
+        "speed": (speed if speed is not None else ELEVEN_SPEED),
     }
     body = {"text": text, "model_id": os.getenv("ELEVENLABS_MODEL_ID", "eleven_monolingual_v1"),
             "voice_settings": voice_settings}
@@ -513,7 +513,7 @@ class TTSSpeaker:
         await self.ws.send_text(json.dumps({"event": "mark", "streamSid": self.stream_sid, "mark": {"name": mark_name}}))
         log.info(f"[tts] streamed {total} ulaw bytes to Twilio (mark={mark_name})")
 
-    async def enqueue_text(self, text: str, protect: bool = False):
+    async def enqueue_text(self, text: str, protect: bool = False, **tts_overrides):
         now = time.monotonic()
         min_gap = TTS_MIN_GAP_AFTER_BARGE_MS if self.after_barge else TTS_MIN_GAP_MS
         if (now - self._last_reply_at) * 1000 < min_gap:
@@ -523,7 +523,7 @@ class TTSSpeaker:
             log.info("[tts] suppressed (dedupe)"); return
         self._last_hash = h; self._last_reply_at = now
 
-        data, fmt = await elevenlabs_tts_bytes(text)
+        data, fmt = await elevenlabs_tts_bytes(text, **tts_overrides)
         ulaw = convert_elevenlabs_to_ulaw8k(data, fmt, gain_db=TTS_GAIN_DB)
         if self.recorder and RECORD_CALL:
             self.recorder.add_tts(text)
@@ -554,8 +554,65 @@ async def twilio_media_ws(ws: WebSocket):
     recorder = None
     call_sid = None
 
+    # --- back-channel acks + tone pacing (toggleable) ---
+    ACKS_ENABLED = os.getenv("ACKS_ENABLED", "1") == "1"
+    ACK_DELAY_MS = int(os.getenv("ACK_DELAY_MS", "420"))
+    ACK_MAX_DURATION_S = float(os.getenv("ACK_MAX_DURATION_S", "0.7"))
+    ACK_MIN_CONTENT_CHARS = int(os.getenv("ACK_MIN_CONTENT_CHARS", "3"))
+    ACK_PROMPT_DELAY_MS = int(os.getenv("ACK_PROMPT_DELAY_MS", "900"))  # delay after ack before main prompt
+
+    SPEED_MIN = float(os.getenv("SPEED_MIN", "0.78"))
+    SPEED_MAX = float(os.getenv("SPEED_MAX", "0.98"))
+
+    ack_task = None
+
+    def _cancel_ack():
+        nonlocal ack_task
+        if ack_task and not ack_task.done():
+            ack_task.cancel()
+        ack_task = None
+
+    async def _delayed_ack():
+        # say a tiny acknowledgement unless already speaking
+        nonlocal speaker
+        await asyncio.sleep(ACK_DELAY_MS / 1000.0)
+        try:
+            if speaker and speaker.playing:
+                return
+        except Exception:
+            pass
+        try:
+            await speaker.enqueue_text("Okay.", protect=False)
+        except Exception:
+            pass
+
+    def _should_backchannel(text: str, duration_s: float) -> bool:
+        if not ACKS_ENABLED:
+            return False
+        if duration_s > ACK_MAX_DURATION_S:
+            return False
+        t = (text or "").strip().lower()
+        if len(t) < ACK_MIN_CONTENT_CHARS:
+            return False
+        if t in {"uh", "um", "hmm", "er", "uhh", "hello", "hi"}:
+            return False
+        return True
+
+    def _tone_adjust(user_text: str):
+        t = (user_text or "").lower()
+        urgent = any(w in t for w in ["urgent", "hurry", "now", "stuck", "blocked", "danger", "hazard", "exit", "baby", "child"])
+        frustrated = any(w in t for w in ["angry", "mad", "upset", "ridiculous", "waiting", "late", "come on", "seriously"])
+        uncertain = any(w in t for w in ["uh", "um", "maybe", "i think", "not sure"])
+        if urgent:
+            return +0.03, 0.35
+        if frustrated:
+            return -0.03, 0.10
+        if uncertain:
+            return -0.02, 0.20
+        return 0.0, None
+
     def on_text(text: str, pcm: bytes):
-        nonlocal state, speaker, recorder
+        nonlocal state, speaker, recorder, ack_task
         state.update_from_text(text)
         need = state.need()
 
@@ -566,7 +623,28 @@ async def twilio_media_ws(ws: WebSocket):
 
         protect_first = (not state.first_reply_sent) and FIRST_REPLY_NO_BARGE
         state.first_reply_sent = True
-        asyncio.create_task(speaker.enqueue_text(prompt, protect=protect_first))
+
+        # duration of this user clip in seconds
+        try:
+            duration_s = len(pcm) / float(SAMPLE_RATE_IN * BYTES_PER_SAMPLE)
+        except Exception:
+            duration_s = 0.0
+
+        # tiny tone-aware pacing
+        spd_delta, style_override = _tone_adjust(text)
+        base_speed = ELEVEN_SPEED
+        speed = max(SPEED_MIN, min(SPEED_MAX, base_speed + spd_delta))
+
+        if _should_backchannel(text, duration_s):
+            _cancel_ack()
+            async def _prompt_after_ack():
+                await asyncio.sleep((ACK_DELAY_MS + ACK_PROMPT_DELAY_MS) / 1000.0)
+                await speaker.enqueue_text(prompt, protect=protect_first, speed=speed, style=style_override)
+            ack_task = asyncio.create_task(_delayed_ack())
+            asyncio.create_task(_prompt_after_ack())
+        else:
+            _cancel_ack()
+            asyncio.create_task(speaker.enqueue_text(prompt, protect=protect_first, speed=speed, style=style_override))
 
     stt = STTBuffer(on_text=on_text)  # set recorder after 'start'
     log.info("WS accepted (subprotocol=audio): /twilio/media")
