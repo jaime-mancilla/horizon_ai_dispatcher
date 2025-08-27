@@ -15,11 +15,13 @@ import zipfile
 
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, HTTPException
+
 from app.core.recorder import Recorder
 from app.core.stt import STTBuffer, set_openai_client as stt_set_client
 from app.core.dialog import DialogState
 from app.core.tts import TTSSpeaker
-
+from app.core.audio_utils import _rms, _silence_ulaw, _to_wav, _apply_gain_linear, _parse_wav, _peak_normalize, _to_ulaw_8k_from_linear, convert_elevenlabs_to_ulaw8k
+from app import config as _config  # ensure env constants are initialized
 from fastapi.responses import PlainTextResponse, FileResponse
 from starlette.websockets import WebSocketState
 
@@ -29,17 +31,12 @@ try:
     _openai_client = OpenAI()
 except Exception:
     _openai_client = None
-# wire STTBuffer to the OpenAI client
-try:
-    stt_set_client(_openai_client)
-except Exception:
-    pass
-
 
 log = logging.getLogger("hid.media")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 app = FastAPI(title="Horizon AI Dispatcher (Track B)")
+stt_set_client(_openai_client)
 
 # ---------- Config ----------
 SAMPLE_RATE_IN = 8000
@@ -100,38 +97,80 @@ def _public_ws_url(request: Request) -> str:
     scheme = "wss" # Render is behind HTTPS; Twilio Media Stream should use wss
     return f"{scheme}://{host}/twilio/media"
 
-def _rms(pcm16: bytes) -> float:
-    try:
-        return audioop.rms(pcm16, 2)
-    except Exception:
-        return 0.0
+def _apply_gain_linear(frames: bytes, sampwidth: int, gain_db: float) -> bytes:
+    if gain_db <= 0: return frames
+    factor = pow(10.0, gain_db / 20.0)
+    try: return audioop.mul(frames, sampwidth, factor)
+    except Exception: return frames
 
-def _silence_ulaw(ms: int) -> bytes:
-    samples = int(8000 * ms / 1000)
-    return bytes([0xFF]) * samples  # μ-law silence byte
+def _parse_wav(data: bytes):
+    with wave.open(BytesIO(data), "rb") as wf:
+        return wf.getnchannels(), wf.getsampwidth(), wf.getframerate(), wf.readframes(wf.getnframes())
 
-def _to_wav(path: Path, pcm16: bytes, sr: int = 8000):
-    with wave.open(str(path), "wb") as wf:
-        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sr)
-        wf.writeframes(pcm16)
+def _peak_normalize(pcm16: bytes, target_ratio: float) -> bytes:
+    if not pcm16: return pcm16
+    peak = 1
+    for i in range(0, len(pcm16), 2):
+        s = int.from_bytes(pcm16[i:i+2], "little", signed=True)
+        if abs(s) > peak: peak = abs(s)
+    max_allowed = int(32767 * target_ratio)
+    if peak <= 0 or peak <= max_allowed: return pcm16
+    scale = max_allowed / float(peak)
+    out = bytearray(len(pcm16))
+    for i in range(0, len(pcm16), 2):
+        s = int.from_bytes(pcm16[i:i+2], "little", signed=True)
+        s = int(s * scale)
+        if s > 32767: s = 32767
+        if s < -32768: s = -32768
+        out[i:i+2] = s.to_bytes(2, "little", signed=True)
+    return bytes(out)
 
-# ---------- HTTP ----------
-@app.get("/healthz")
-async def healthz():
-    return {"status": "ok"}
+def _to_ulaw_8k_from_linear(frames: bytes, sw: int, sr: int, nch: int, gain_db: float = 0.0) -> bytes:
+    if sw != 2: frames = audioop.lin2lin(frames, sw, 2); sw = 2
+    if nch == 2: frames = audioop.tomono(frames, 2, 0.5, 0.5); nch = 1
+    if sr != 8000: frames, _ = audioop.ratecv(frames, 2, 1, sr, 8000, None); sr = 8000
+    frames = _peak_normalize(frames, TTS_PEAK_TARGET)
+    if gain_db > 0: frames = _apply_gain_linear(frames, 2, gain_db)
+    return audioop.lin2ulaw(frames, 2)
 
-@app.post("/twilio/voice", response_class=PlainTextResponse)
-async def twilio_voice_webhook(request: Request):
-    ws_url = _public_ws_url(request)
-    start_record = "<Start><Recording/></Start>" if TWILIO_RECORD_CALL else ""
-    log.info(f"Returning TwiML with Media Stream URL: {ws_url}")
-    twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  {start_record}
-  <Say>Horizon Road Rescue dispatcher connected. Please speak after the tone.</Say>
-  <Connect><Stream url="{ws_url}" /></Connect>
-</Response>'''
-    return Response(content=twiml, media_type="application/xml")
+async def elevenlabs_tts_bytes(text: str, speed: float | None = None, style: float | None = None) -> tuple[bytes, str]:
+    api_key = os.getenv("ELEVENLABS_API_KEY"); voice_id = os.getenv("ELEVENLABS_VOICE_ID")
+    if not api_key or not voice_id: raise RuntimeError("Missing ELEVENLABS env vars")
+    fmt = ELEVEN_FMT
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    params = {"optimize_streaming_latency": str(ELEVEN_LATENCY_MODE), "output_format": fmt}
+    accept = "audio/wav" if fmt == "wav" else "audio/pcm"
+    headers = {"xi-api-key": api_key, "accept": accept, "content-type": "application/json"}
+    voice_settings = {
+        "stability": ELEVEN_STABILITY,
+        "similarity_boost": ELEVEN_SIMILARITY,
+        "style": (style if style is not None else ELEVEN_STYLE),
+        "use_speaker_boost": ELEVEN_SPEAKER_BOOST,
+        "speed": (speed if speed is not None else ELEVEN_SPEED),
+    }
+    body = {"text": text, "model_id": os.getenv("ELEVENLABS_MODEL_ID", "eleven_monolingual_v1"),
+            "voice_settings": voice_settings}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(35.0)) as client:
+        r = await client.post(url, headers=headers, params=params, json=body)
+        if r.status_code != 200:
+            raise RuntimeError(f"ElevenLabs TTS failed: {r.status_code} {r.text[:200]}")
+        return r.content, fmt
 
-# ---------- Recording manager ----------
-# moved to app.core.recorder
+def convert_elevenlabs_to_ulaw8k(data: bytes, fmt: str, gain_db: float) -> bytes:
+    if fmt == "wav":
+        nch, sw, sr, frames = _parse_wav(data)
+    elif fmt == "pcm_16000":
+        nch, sw, sr, frames = 1, 2, 16000, data
+    else:
+        try: nch, sw, sr, frames = _parse_wav(data)
+        except Exception: nch, sw, sr, frames = 1, 2, 16000, data
+    ulaw = _to_ulaw_8k_from_linear(frames, sw, sr, nch, gain_db=gain_db)
+    pre = _silence_ulaw(TTS_PAD_PRE_MS); post = _silence_ulaw(TTS_PAD_POST_MS)
+    return pre + ulaw + post
+
+# ---------- Conversation state (simple) ----------
+VEHICLE_MAKES = r"(ford|chevy|chevrolet|gmc|ram|dodge|toyota|honda|nissan|jeep|bmw|mercedes|benz|kia|hyundai|subaru|vw|volkswagen|audi|lexus|infiniti|acura|mazda|buick|cadillac|chrysler|lincoln|volvo|porsche|jaguar|land rover|mini|mitsubishi|tesla)"
+VEHICLE_TYPES = r"(car|truck|suv|van|pickup|tow ?truck|box ?truck)"
+LOC_HINTS = r"(nashville|tennessee|i[- ]?\d+|hwy|highway|exit|rd|road|st|street|ave|avenue|blvd|pike|tn-?\d+)"
+ISSUE_HINTS = r"(flat|tire|battery|dead|won'?t start|no start|engine|overheat|overheating|accident|lock(ed)? out|fuel|gas|out of gas|tow|winch|ditch|stuck)"
+
